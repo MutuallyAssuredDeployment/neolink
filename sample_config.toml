@@ -58,6 +58,12 @@ address = "192.168.1.187:9000"
 # If your device has user connection limits try a single stream instead.
 # stream = "mainStream"
 
+# Disable audio pipeline to save CPU when running multiple cameras
+# enable_audio = true
+
+# Enable low latency mode (sets min_latency on AppSrc elements)
+# enable_low_latency = false
+
 # By default neolink will use any means to connect to the camera
 # from a UID
 # This include relaying via reolink servers
