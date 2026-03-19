@@ -1,7 +1,7 @@
 # Configuration Reference
 
 Neolink is configured with a TOML file. See
-[sample_config.toml](https://github.com/janost/neolink/blob/master/sample_config.toml)
+[sample_config.toml](https://github.com/MutuallyAssuredDeployment/neolink/blob/master/sample_config.toml)
 for a complete example.
 
 ## Global Settings

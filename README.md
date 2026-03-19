@@ -1,7 +1,7 @@
 # Neolink
 
-![Docker GHCR](https://github.com/janost/neolink/actions/workflows/docker-ghcr.yml/badge.svg)
-[![dependency status](https://deps.rs/repo/github/janost/neolink/status.svg)](https://deps.rs/repo/github/janost/neolink)
+![Docker GHCR](https://github.com/MutuallyAssuredDeployment/neolink/actions/workflows/docker-ghcr.yml/badge.svg)
+[![dependency status](https://deps.rs/repo/github/MutuallyAssuredDeployment/neolink/status.svg)](https://deps.rs/repo/github/MutuallyAssuredDeployment/neolink)
 
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
 normal RTSP clients.
@@ -65,8 +65,8 @@ provided.
 Images are published to GHCR on every push to `master` and on tags:
 
 ```bash
-docker pull ghcr.io/janost/neolink:dev     # latest master
-docker pull ghcr.io/janost/neolink:latest   # latest tagged release
+docker pull ghcr.io/mutuallyassureddeployment/neolink:dev     # latest master
+docker pull ghcr.io/mutuallyassureddeployment/neolink:latest   # latest tagged release
 ```
 
 Run with:
@@ -75,7 +75,7 @@ Run with:
 docker run \
   --network host \
   --volume=$PWD/neolink.toml:/etc/neolink.toml \
-  ghcr.io/janost/neolink
+  ghcr.io/mutuallyassureddeployment/neolink
 ```
 
 > `--network host` is only needed for local broadcast discovery. If you connect
@@ -117,7 +117,7 @@ Detailed docs are in the [`docs/`](docs/) directory:
 ## Configuration
 
 Create a `neolink.toml` file. See
-[sample_config.toml](https://github.com/janost/neolink/blob/master/sample_config.toml)
+[sample_config.toml](https://github.com/MutuallyAssuredDeployment/neolink/blob/master/sample_config.toml)
 for all options.
 
 Minimal example:
@@ -216,7 +216,7 @@ All messages are prefixed with `neolink/` or `neolink/{CAMERA_NAME}/`.
 **Query** (`/query/...`): `battery`, `pir`, `ptz/preset`, `preview`
 
 See the
-[sample config](https://github.com/janost/neolink/blob/master/sample_config.toml)
+[sample config](https://github.com/MutuallyAssuredDeployment/neolink/blob/master/sample_config.toml)
 for per-camera MQTT options (`enable_motion`, `enable_preview`,
 `enable_battery`, etc.).
 
