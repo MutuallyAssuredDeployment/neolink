@@ -1085,8 +1085,6 @@ fn make_queue(name: &str, buffer_size: u32, low_latency: bool) -> AnyResult<Elem
     if low_latency {
         // 200ms max queue time — ~5 frames at 25fps
         queue.set_property("max-size-time", 200_000_000u64);
-        // Drop oldest data when full instead of blocking
-        queue.set_property_from_str("leaky", "downstream");
     } else {
         queue.set_property(
             "max-size-time",
