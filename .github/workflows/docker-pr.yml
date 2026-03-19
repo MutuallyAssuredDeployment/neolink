@@ -3,6 +3,9 @@ name: Docker PR Build
 on:
   pull_request:
     types: [opened, synchronize, labeled]
+    paths-ignore:
+      - "*.md"
+      - "docs/**"
 
 concurrency:
   group: docker-pr-${{ github.event.pull_request.number }}
