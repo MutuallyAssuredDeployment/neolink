@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize, labeled]
 
+concurrency:
+  group: docker-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
