@@ -188,7 +188,11 @@ pub(super) async fn make_factory(
                         while let Some(media) = media_rx.recv().await {
                             stream_config.update_from_media(&media);
                             buffer.push(media);
-                            if frame_count > 10
+                            if stream_config.enable_low_latency {
+                                if stream_config.vid_type.is_some() || frame_count > 3 {
+                                    break;
+                                }
+                            } else if frame_count > 10
                                 || (stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
                             {
@@ -605,7 +609,7 @@ struct Linked {
 }
 
 fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = buffer_size(stream_config.bitrate);
+    let buffer_size = buffer_size(stream_config.bitrate, stream_config.enable_low_latency);
     log::debug!(
         "buffer_size: {buffer_size}, bitrate: {}",
         stream_config.bitrate
@@ -666,7 +670,7 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = buffer_size(stream_config.bitrate);
+    let buffer_size = buffer_size(stream_config.bitrate, stream_config.enable_low_latency);
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -1093,7 +1097,12 @@ fn make_queue(name: &str, buffer_size: u32, low_latency: bool) -> AnyResult<Elem
     Ok(queue)
 }
 
-fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+fn buffer_size(bitrate: u32, low_latency: bool) -> u32 {
+    if low_latency {
+        // ~1 frame worth of buffer
+        std::cmp::max(bitrate / 8u32, 4u32 * 1024u32)
+    } else {
+        // ~0.25 seconds of buffer
+        std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+    }
 }
