@@ -103,6 +103,17 @@ sudo apt install \
 cargo build --release
 ```
 
+## Documentation
+
+Detailed docs are in the [`docs/`](docs/) directory:
+
+- [Configuration Reference](docs/configuration.md) — all config options, discovery, TLS, users, pause/idle
+- [MQTT](docs/mqtt.md) — full message reference, Home Assistant discovery, runtime control
+- [CLI Commands](docs/commands.md) — image capture, PTZ, talk, encoding, disk management
+- [Setting Up with Blue Iris](docs/Setting%20Up%20Neolink%20For%20Use%20With%20Blue%20Iris.md)
+- [Unix Service Setup](docs/unix_service.md)
+- [Unix Build Setup](docs/unix_setup.md)
+
 ## Configuration
 
 Create a `neolink.toml` file. See
@@ -248,3 +259,13 @@ neolink disk     --config=neolink.toml CameraName
 
 Neolink is free software, released under the GNU Affero General Public License
 v3.
+
+## Donations
+
+The original upstream project was created by
+[@thirtythreeforty](https://github.com/thirtythreeforty) and maintained by
+[@QuantumEntangledAndy](https://github.com/QuantumEntangledAndy). If you'd like
+to support the original author's work (note: the upstream repo is currently
+unmaintained):
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2G5HOYIZ)
