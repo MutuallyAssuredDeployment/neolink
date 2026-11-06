@@ -925,6 +925,7 @@ local function udp_reassemple(udp_header, subbuffer, more, pinfo, tree)
         if next_fragment ~= nil then
           reassembled = reassembled .. next_fragment.buffer
           total_packet = total_packet + 1
+          next_id = next_id + 1
         else
           break
         end
