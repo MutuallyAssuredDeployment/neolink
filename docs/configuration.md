@@ -55,7 +55,7 @@ enable_low_latency = false       # reduce stream delay (default: false)
 # Diagnostics
 debug = false                    # dump raw XML from camera
 print_format = "None"            # "None", "Human", or "Xml" for status messages
-update_time = false              # force camera clock sync on connect
+update_time = false              # force camera clock sync on connect (uses local wall-clock time)
 
 # NVR channel (for multi-camera NVRs)
 channel_id = 0                   # 0-indexed camera on NVR

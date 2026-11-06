@@ -38,6 +38,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.50.0", features = ["rt-multi-thread", "macros", "io-util", "tracing", "signal"] }
 tokio-stream = "0.1.18"
+time = { version = "0.3", features = ["local-offset"] }
 tokio-util = { version = "0.7.18", features = ["full", "tracing"] }
 toml = "1.0.7"
 uuid = { version = "1.22.0", features = ["v4"] }

@@ -43,6 +43,7 @@ merged, plus additional improvements:
 - Low-latency RTSP mode with frame draining, live-mode AppSrc, and reduced buffers
 - Docker images published to GHCR instead of Docker Hub
 - Updated dependencies and Debian Trixie base image
+- Use local timezone when using `update_time` to set camera time
 
 **Inherited features from upstream:**
 
