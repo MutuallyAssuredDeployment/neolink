@@ -1,10 +1,11 @@
-//! GStreamer pipeline to mux H.264 + optional AAC audio to MP4.
+//! GStreamer pipeline to mux H.264/H.265 + optional AAC audio to MP4.
 //! Supports per-frame timestamps (VFR) via appsrc PTS.
 //! Requires the `gstreamer` feature.
 
 use anyhow::{Context, Result};
 use gstreamer::prelude::*;
 use gstreamer::{Caps, ClockTime, MessageView, Pipeline, State};
+use neolink_core::bcmedia::model::VideoType;
 use gstreamer_app::AppSrc;
 use std::path::Path;
 
@@ -25,7 +26,7 @@ pub struct Mp4Metadata {
     pub camera_name: Option<String>,
 }
 
-/// Mux H.264 NALs with per-frame timestamps (+ optional AAC audio) to MP4 using GStreamer.
+/// Mux H.264/H.265 NALs with per-frame timestamps (+ optional AAC audio) to MP4 using GStreamer.
 ///
 /// Pipeline:
 ///   video: appsrc(PTS per buffer) ! h264parse ! mp4mux ! filesink
@@ -37,6 +38,7 @@ pub struct Mp4Metadata {
 /// If `metadata` is provided, AI detection tags and recording times are embedded as MP4 tags.
 pub fn mux_nals_to_mp4(
     nals: &[Vec<u8>],
+    video_type: VideoType,
     timestamps_us: &[u32],
     aac_data: &[u8],
     output_path: &Path,
@@ -52,9 +54,13 @@ pub fn mux_nals_to_mp4(
         .context("create video appsrc")?
         .downcast::<AppSrc>()
         .map_err(|_| anyhow::anyhow!("appsrc downcast"))?;
-    let h264parse = gstreamer::ElementFactory::make("h264parse")
+    let (parser_name, caps_name) = match video_type {
+        VideoType::H264 => ("h264parse", "video/x-h264"),
+        VideoType::H265 => ("h265parse", "video/x-h265"),
+    };
+    let video_parse = gstreamer::ElementFactory::make(parser_name)
         .build()
-        .context("create h264parse")?;
+        .with_context(|| format!("create {}", parser_name))?;
     let mp4mux = gstreamer::ElementFactory::make("mp4mux")
         .build()
         .context("create mp4mux")?;
@@ -65,12 +71,12 @@ pub fn mux_nals_to_mp4(
     filesink.set_property("location", output_path);
 
     let video_src_el = video_src.upcast_ref();
-    pipeline.add_many([video_src_el, &h264parse, &mp4mux, &filesink])?;
-    video_src_el.link(&h264parse)?;
-    h264parse.link(&mp4mux)?;
+    pipeline.add_many([video_src_el, &video_parse, &mp4mux, &filesink])?;
+    video_src_el.link(&video_parse)?;
+    video_parse.link(&mp4mux)?;
     mp4mux.link(&filesink)?;
 
-    let caps = Caps::builder("video/x-h264")
+    let caps = Caps::builder(caps_name)
         .field("stream-format", "byte-stream")
         .build();
     video_src.set_caps(Some(&caps));

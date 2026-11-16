@@ -48,19 +48,24 @@ fn find_bcmedia_magic_offset(stream: &[u8]) -> Option<usize> {
     None
 }
 
-/// True if payload looks like a valid H.264 NAL (NAL type 1–9). Drops garbage from resync false positives.
-fn is_likely_valid_h264_nal(payload: &[u8]) -> bool {
+/// True if payload looks like a valid H.264 or H.265 NAL. Drops garbage from resync false positives.
+fn is_likely_valid_nal(payload: &[u8], video_type: VideoType) -> bool {
     if payload.is_empty() {
         return false;
     }
-    let nal_type = if payload.len() >= 5 && payload[0..4] == [0x00, 0x00, 0x00, 0x01] {
-        payload[4] & 0x1F
+    let nal_header = if payload.len() >= 5 && payload[0..4] == [0x00, 0x00, 0x00, 0x01] {
+        &payload[4..]
     } else if payload.len() >= 4 && payload[0..3] == [0x00, 0x00, 0x01] {
-        payload[3] & 0x1F
+        &payload[3..]
     } else {
-        payload[0] & 0x1F
+        payload
     };
-    (1..=9).contains(&nal_type)
+    match video_type {
+        VideoType::H264 => (1..=9).contains(&(nal_header[0] & 0x1F)),
+        VideoType::H265 => {
+            nal_header.len() >= 2 && nal_header[0] & 0x80 == 0 && (nal_header[0] >> 1) <= 40
+        }
+    }
 }
 
 /// Max bytes to advance on Incomplete without finding any NAL. Prevents hanging on garbage/ciphertext (e.g. undecrypted replay).
@@ -70,11 +75,12 @@ const BCMEDIA_RESYNC_CAP: usize = 128 * 1024;
 /// Returns Some((nals, fps)) if at least one IFRAME/PFRAME was decoded; None if stream is not BcMedia or has no video.
 /// fps is extracted from the BcMediaInfoV1/V2 header if present, otherwise defaults to 25.
 /// When the codec returns Incomplete (Ok(None)) we resync to the next frame and continue, so a full buffer is decoded.
-/// Only payloads that look like valid H.264 NALs are collected to avoid garbage from resync.
+/// Only payloads that look like valid H.264/H.265 NALs are collected to avoid garbage from resync.
 /// See notes/REPLAY_VIDEO_FORMAT.md.
 /// Result of decoding a BcMedia stream.
 struct BcMediaDecoded {
     nals: Vec<Vec<u8>>,
+    video_type: VideoType,
     fps: u8,
     /// Per-frame microsecond timestamps from BcMedia headers (same length as `nals`).
     timestamps_us: Vec<u32>,
@@ -88,22 +94,25 @@ fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
     let mut nals: Vec<Vec<u8>> = Vec::new();
     let mut timestamps_us: Vec<u32> = Vec::new();
     let mut fps: u8 = 25; // default; overridden by InfoV1/V2 if present
+    let mut video_type = VideoType::H264;
     let mut aac_data: Vec<u8> = Vec::new();
     let start_len = buf.len();
     let mut bytes_advanced_without_nal: usize = 0;
     loop {
         match codec.decode(&mut buf) {
-            Ok(Some(BcMedia::Iframe(BcMediaIframe { data, microseconds, .. }))) => {
-                if is_likely_valid_h264_nal(&data) {
+            Ok(Some(BcMedia::Iframe(BcMediaIframe { data, microseconds, video_type: frame_type, .. }))) => {
+                if is_likely_valid_nal(&data, frame_type) {
                     nals.push(data);
                     timestamps_us.push(microseconds);
+                    video_type = frame_type;
                     bytes_advanced_without_nal = 0;
                 }
             }
-            Ok(Some(BcMedia::Pframe(BcMediaPframe { data, microseconds, .. }))) => {
-                if is_likely_valid_h264_nal(&data) {
+            Ok(Some(BcMedia::Pframe(BcMediaPframe { data, microseconds, video_type: frame_type, .. }))) => {
+                if is_likely_valid_nal(&data, frame_type) {
                     nals.push(data);
                     timestamps_us.push(microseconds);
+                    video_type = frame_type;
                     bytes_advanced_without_nal = 0;
                 }
             }
@@ -138,7 +147,17 @@ fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
     if !aac_data.is_empty() {
         log::info!("Replay: collected {} bytes of AAC audio from BcMedia stream", aac_data.len());
     }
-    if nals.is_empty() { None } else { Some(BcMediaDecoded { nals, fps, timestamps_us, aac_data }) }
+    if nals.is_empty() {
+        None
+    } else {
+        Some(BcMediaDecoded {
+            nals,
+            video_type,
+            fps,
+            timestamps_us,
+            aac_data,
+        })
+    }
 }
 
 /// Compute actual average fps from per-frame microsecond timestamps. Returns None if < 2 frames.
@@ -190,6 +209,7 @@ struct RecordingMeta {
 /// Returns Ok(true) on success.
 async fn mux_to_mp4(
     nals: &[Vec<u8>],
+    video_type: VideoType,
     aac_data: &[u8],
     fps: u8,
     timestamps_us: &[u32],
@@ -207,6 +227,7 @@ async fn mux_to_mp4(
     #[cfg(feature = "gstreamer")]
     {
         let nals = nals.to_vec();
+        let video_type = video_type;
         let timestamps_us = timestamps_us.to_vec();
         let aac_data = aac_data.to_vec();
         let path = output.to_path_buf();
@@ -217,7 +238,14 @@ async fn mux_to_mp4(
             camera_name: meta.camera_name.clone(),
         };
         match tokio::task::spawn_blocking(move || {
-            gst::mux_nals_to_mp4(&nals, &timestamps_us, &aac_data, &path, &gst_meta)
+            gst::mux_nals_to_mp4(
+                &nals,
+                video_type,
+                &timestamps_us,
+                &aac_data,
+                &path,
+                &gst_meta,
+            )
         })
         .await
         {
@@ -232,9 +260,15 @@ async fn mux_to_mp4(
     let fps_str = format!("{:.3}", effective_fps);
     log::info!("Replay: muxing with ffmpeg at {} fps (fallback)", fps_str);
 
-    let h264_path = output.with_extension("replay.h264");
+    let (temp_extension, input_format) = match video_type {
+        VideoType::H264 => ("replay.h264", "h264"),
+        VideoType::H265 => ("replay.h265", "hevc"),
+    };
+    let video_path = output.with_extension(temp_extension);
     let annex_b = annex_b_from_nals(nals);
-    tokio::fs::write(&h264_path, &annex_b).await.context("Write temp H.264")?;
+    tokio::fs::write(&video_path, &annex_b)
+        .await
+        .context("Write temporary Annex B video")?;
 
     let aac_path = output.with_extension("replay.aac");
     if !aac_data.is_empty() {
@@ -242,9 +276,11 @@ async fn mux_to_mp4(
     }
 
     let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.args(["-y", "-hide_banner", "-loglevel", "error",
-              "-fflags", "+genpts", "-r", &fps_str, "-f", "h264", "-i"]);
-    cmd.arg(&h264_path);
+    cmd.args([
+        "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-r",
+        &fps_str, "-f", input_format, "-i",
+    ]);
+    cmd.arg(&video_path);
     if !aac_data.is_empty() {
         cmd.args(["-f", "aac", "-i"]);
         cmd.arg(&aac_path);
@@ -260,11 +296,59 @@ async fn mux_to_mp4(
     cmd.arg(output);
 
     let status = cmd.status().await.context("Run ffmpeg for BcMedia mux")?;
-    let _ = tokio::fs::remove_file(&h264_path).await;
+    let _ = tokio::fs::remove_file(&video_path).await;
     if !aac_data.is_empty() {
         let _ = tokio::fs::remove_file(&aac_path).await;
     }
     Ok(status.success())
+}
+
+/// Save downloaded video as MP4 when a muxer is available, otherwise retain an
+/// elementary Annex B stream with an extension that matches its codec.
+async fn write_video_output(
+    nals: &[Vec<u8>],
+    video_type: VideoType,
+    aac_data: &[u8],
+    fps: u8,
+    timestamps_us: &[u32],
+    output: &Path,
+    meta: &RecordingMeta,
+) -> Result<()> {
+    let is_mp4 = output
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("mp4"))
+        .unwrap_or(false);
+    if is_mp4 {
+        match mux_to_mp4(nals, video_type, aac_data, fps, timestamps_us, output, meta).await {
+            Ok(true) => {
+                println!("Wrote downloaded video as MP4 to {}", output.display());
+                return Ok(());
+            }
+            Ok(false) => log::warn!("Replay: MP4 mux failed; keeping the elementary video stream"),
+            Err(e) => log::warn!("Replay: MP4 mux unavailable: {:?}; keeping the elementary video stream", e),
+        }
+    }
+
+    let fallback_output = if is_mp4 {
+        let extension = match video_type {
+            VideoType::H264 => "h264",
+            VideoType::H265 => "h265",
+        };
+        output.with_extension(extension)
+    } else {
+        output.to_path_buf()
+    };
+    let annex_b = annex_b_from_nals(nals);
+    tokio::fs::write(&fallback_output, &annex_b)
+        .await
+        .context("Write Annex B video")?;
+    println!(
+        "Wrote {} bytes of Annex B video to {}",
+        annex_b.len(),
+        fallback_output.display()
+    );
+    Ok(())
 }
 
 /// Format a ReplayDateTime as "YYYY-MM-DD HH:MM:SS".
@@ -275,7 +359,7 @@ fn format_replay_datetime(dt: &ReplayDateTime) -> String {
     )
 }
 
-/// Write NAL payloads as H.264 Annex B (start code + NAL). Payloads that already start with 0x00 0x00 0x01 or 0x00 0x00 0x00 0x01 are written as-is.
+/// Write H.264/H.265 NAL payloads as Annex B. Existing start codes are preserved.
 fn annex_b_from_nals(nals: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for nal in nals {
@@ -289,7 +373,7 @@ fn annex_b_from_nals(nals: &[Vec<u8>]) -> Vec<u8> {
     out
 }
 
-/// H.264 Annex B start codes: 0x00 0x00 0x01 or 0x00 0x00 0x00 0x01.
+/// Annex B start codes: 0x00 0x00 0x01 or 0x00 0x00 0x00 0x01.
 /// Kept for potential use when scanning raw buffers for Annex B.
 #[allow(dead_code)]
 fn find_annexb_h264_start(buffer: &[u8]) -> Option<usize> {
@@ -310,8 +394,9 @@ use crate::common::NeoReactor;
 use bytes::{Buf, BytesMut};
 use neolink_core::bc::xml::{DayRecords, FileInfo, ReplayDateTime};
 use neolink_core::bcmedia::codex::BcMediaCodex;
-use neolink_core::bcmedia::model::{BcMedia, BcMediaAac, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe};
-use tokio::io::AsyncWriteExt;
+use neolink_core::bcmedia::model::{
+    BcMedia, BcMediaAac, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
+};
 use tokio::time::{sleep_until, Duration, Instant};
 use tokio_util::codec::Decoder;
 
@@ -848,10 +933,11 @@ async fn run_replay_or_download(
     duration: Option<u64>,
     dump_replay: Option<std::path::PathBuf>,
     dump_replay_limit: Option<usize>,
-    _is_download: bool,
+    is_download: bool,
 ) -> Result<()> {
     log::info!(
-        "Replay play: name={} stream={} speed={}",
+        "Replay {}: name={} stream={} speed={}",
+        if is_download { "download" } else { "play" },
         name,
         stream_type,
         speed
@@ -932,15 +1018,14 @@ async fn run_replay_or_download(
         })
         .await?;
 
-    // When no output path is given, use a sink so we don't flood the terminal with binary.
-    let mut out: Box<dyn tokio::io::AsyncWrite + Unpin + Send> = match &output {
-        Some(p) => Box::new(tokio::fs::File::create(p).await?),
-        None => Box::new(tokio::io::sink()),
-    };
-
     let mut frames: u64 = 0;
     let mut raw_bytes: u64 = 0;
     let mut raw_replay_buffer: Vec<u8> = Vec::new(); // when writing to file, buffer raw chunks to assemble with mdat
+    let mut video_nals: Vec<Vec<u8>> = Vec::new();
+    let mut timestamps_us: Vec<u32> = Vec::new();
+    let mut aac_data: Vec<u8> = Vec::new();
+    let mut video_fps: u8 = 25;
+    let mut video_type = VideoType::H264;
     // Skip first 32 bytes only when replay was started with MSG 5 (app parity; set when we receive ReplayStarted).
     let mut skip_first_32: Option<bool> = None;
     let deadline = duration.map(|secs| Instant::now() + Duration::from_secs(secs));
@@ -969,13 +1054,27 @@ async fn run_replay_or_download(
         };
 
         match res {
-            Ok(Ok(BcMedia::Iframe(BcMediaIframe { data, .. })))
-            | Ok(Ok(BcMedia::Pframe(BcMediaPframe { data, .. }))) => {
-                out.write_all(&data).await?;
-                out.flush().await?;
+            Ok(Ok(BcMedia::Iframe(BcMediaIframe { data, microseconds, video_type: frame_type, .. })))
+            | Ok(Ok(BcMedia::Pframe(BcMediaPframe { data, microseconds, video_type: frame_type, .. }))) => {
+                if output.is_some() {
+                    video_nals.push(data);
+                    timestamps_us.push(microseconds);
+                    video_type = frame_type;
+                }
                 frames += 1;
                 if frames <= 5 || frames % 30 == 0 {
-                    log::info!("Replay: wrote frame {} to output", frames);
+                    log::info!("Replay: received frame {}", frames);
+                }
+            }
+            Ok(Ok(BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })))
+            | Ok(Ok(BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }))) => {
+                if fps > 0 {
+                    video_fps = fps;
+                }
+            }
+            Ok(Ok(BcMedia::Aac(BcMediaAac { data, .. }))) => {
+                if output.is_some() {
+                    aac_data.extend_from_slice(&data);
                 }
             }
             Ok(Ok(BcMedia::ReplayStarted(msg_id))) => {
@@ -1070,20 +1169,17 @@ async fn run_replay_or_download(
                         Ok(Err(e)) => { log::warn!("Replay: BcMedia decode failed: {:?}", e); None }
                         Err(_) => { log::warn!("Replay: BcMedia decode timed out after {}s", DECODE_MUX_TIMEOUT_SECS); None }
                     };
-                    if let Some(BcMediaDecoded { nals, fps, timestamps_us, aac_data }) = decoded_opt {
-                        let annex_b = annex_b_from_nals(&nals);
-                        let is_mp4 = p.extension().map(|e| e == "mp4").unwrap_or(false);
-                        if is_mp4 {
-                            if mux_to_mp4(&nals, &aac_data, fps, &timestamps_us, p, &recording_meta).await? {
-                                println!("Parsed BcMedia replay and muxed to {}", p.display());
-                            } else {
-                                tokio::fs::write(p, &annex_b).await.context("Write H.264 fallback")?;
-                                println!("Wrote {} bytes (H.264 Annex B) to {} (mux failed)", annex_b.len(), p.display());
-                            }
-                        } else {
-                            tokio::fs::write(p, &annex_b).await.context("Write H.264 replay")?;
-                            println!("Wrote {} bytes (H.264 Annex B) to {}", annex_b.len(), p.display());
-                        }
+                    if let Some(BcMediaDecoded { nals, video_type, fps, timestamps_us, aac_data }) = decoded_opt {
+                        write_video_output(
+                            &nals,
+                            video_type,
+                            &aac_data,
+                            fps,
+                            &timestamps_us,
+                            p,
+                            &recording_meta,
+                        )
+                        .await?;
                     } else {
                         let raw_path = if p.extension().map(|e| e == "mp4").unwrap_or(false) {
                             p.with_extension("replay.raw.bin")
@@ -1106,13 +1202,18 @@ async fn run_replay_or_download(
                 }
             }
         } else if frames > 0 {
-            out.flush().await?;
-            out.shutdown().await?;
-            println!("Wrote {} frames to {}", frames, p.display());
+            write_video_output(
+                &video_nals,
+                video_type,
+                &aac_data,
+                video_fps,
+                &timestamps_us,
+                p,
+                &recording_meta,
+            )
+            .await?;
         }
     } else {
-        out.flush().await?;
-        out.shutdown().await?;
         if raw_bytes > 0 || frames > 0 {
             log::info!("Replay: received {} bytes, {} frames (use --output <path> to save to file)", raw_bytes, frames);
         }
@@ -1177,11 +1278,14 @@ async fn run_download_by_time(
         })
         .await?;
 
-    let mut out: Box<dyn tokio::io::AsyncWrite + Unpin + Send> =
-        Box::new(tokio::fs::File::create(&output).await?);
     let mut frames: u64 = 0;
     let mut raw_bytes: u64 = 0;
     let mut raw_replay_buffer: Vec<u8> = Vec::new();
+    let mut video_nals: Vec<Vec<u8>> = Vec::new();
+    let mut timestamps_us: Vec<u32> = Vec::new();
+    let mut aac_data: Vec<u8> = Vec::new();
+    let mut video_fps: u8 = 25;
+    let mut video_type = VideoType::H264;
     let deadline = duration.map(|secs| Instant::now() + Duration::from_secs(secs));
 
     loop {
@@ -1208,15 +1312,23 @@ async fn run_download_by_time(
         };
 
         match res {
-            Ok(Ok(BcMedia::Iframe(BcMediaIframe { data, .. })))
-            | Ok(Ok(BcMedia::Pframe(BcMediaPframe { data, .. }))) => {
-                out.write_all(&data).await?;
-                out.flush().await?;
+            Ok(Ok(BcMedia::Iframe(BcMediaIframe { data, microseconds, video_type: frame_type, .. })))
+            | Ok(Ok(BcMedia::Pframe(BcMediaPframe { data, microseconds, video_type: frame_type, .. }))) => {
+                video_nals.push(data);
+                timestamps_us.push(microseconds);
+                video_type = frame_type;
                 frames += 1;
                 if frames <= 5 || frames % 30 == 0 {
-                    log::info!("DownloadByTime: wrote frame {} to output", frames);
+                    log::info!("DownloadByTime: received frame {}", frames);
                 }
             }
+            Ok(Ok(BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })))
+            | Ok(Ok(BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }))) => {
+                if fps > 0 {
+                    video_fps = fps;
+                }
+            }
+            Ok(Ok(BcMedia::Aac(BcMediaAac { data, .. }))) => aac_data.extend_from_slice(&data),
             Ok(Ok(BcMedia::RawReplayChunk(data))) => {
                 raw_bytes += data.len() as u64;
                 raw_replay_buffer.extend_from_slice(&data);
@@ -1242,8 +1354,6 @@ async fn run_download_by_time(
     }
 
     drop(stream); // sends MSG 144
-    out.flush().await?;
-    out.shutdown().await?;
 
     if !raw_replay_buffer.is_empty() {
         let stream = stream_for_mp4_assembly(&raw_replay_buffer, None);
@@ -1268,20 +1378,17 @@ async fn run_download_by_time(
                 let stream_to_decode = find_bcmedia_magic_offset(stream)
                     .map(|off| &stream[off..])
                     .unwrap_or(stream);
-                if let Some(BcMediaDecoded { nals, fps, timestamps_us, aac_data }) = try_decode_bcmedia_nals(stream_to_decode) {
-                    let annex_b = annex_b_from_nals(&nals);
-                    let is_mp4 = output.extension().map(|e| e == "mp4").unwrap_or(false);
-                    if is_mp4 {
-                        if mux_to_mp4(&nals, &aac_data, fps, &timestamps_us, &output, &recording_meta).await? {
-                            println!("Parsed BcMedia replay and muxed to {}", output.display());
-                        } else {
-                            tokio::fs::write(&output, &annex_b).await.context("Write H.264 fallback")?;
-                            println!("Wrote {} bytes (H.264 Annex B) to {} (mux failed)", annex_b.len(), output.display());
-                        }
-                    } else {
-                        tokio::fs::write(&output, &annex_b).await.context("Write H.264 replay")?;
-                        println!("Wrote {} bytes (H.264 Annex B) to {}", annex_b.len(), output.display());
-                    }
+                if let Some(BcMediaDecoded { nals, video_type, fps, timestamps_us, aac_data }) = try_decode_bcmedia_nals(stream_to_decode) {
+                    write_video_output(
+                        &nals,
+                        video_type,
+                        &aac_data,
+                        fps,
+                        &timestamps_us,
+                        &output,
+                        &recording_meta,
+                    )
+                    .await?;
                 } else {
                     // Stream is not ftyp MP4 and BcMedia decode yielded no video; don't write to .mp4.
                     let raw_path = if output.extension().map(|e| e == "mp4").unwrap_or(false) {
@@ -1310,7 +1417,16 @@ async fn run_download_by_time(
             }
         }
     } else if frames > 0 {
-        println!("Wrote {} frames to {}", frames, output.display());
+        write_video_output(
+            &video_nals,
+            video_type,
+            &aac_data,
+            video_fps,
+            &timestamps_us,
+            &output,
+            &recording_meta,
+        )
+        .await?;
     }
     Ok(())
 }

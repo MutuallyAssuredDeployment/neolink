@@ -69,6 +69,20 @@ fn strip_e1_replay_envelope(data: &[u8]) -> &[u8] {
     data
 }
 
+/// Remove a per-packet E1 envelope and make standalone H.264 NALs Annex B compatible.
+fn replay_raw_chunk(data: &[u8]) -> Vec<u8> {
+    let payload = strip_e1_replay_envelope(data);
+    let nal_type = payload.first().map(|byte| byte & 0x1f).unwrap_or(0);
+    let is_video_nal = matches!(nal_type, 1 | 5 | 6 | 7 | 8 | 9);
+    let has_start_code = payload.starts_with(&[0, 0, 0, 1]) || payload.starts_with(&[0, 0, 1]);
+    let mut chunk = Vec::with_capacity(payload.len() + 4);
+    if is_video_nal && !has_start_code {
+        chunk.extend_from_slice(&[0, 0, 0, 1]);
+    }
+    chunk.extend_from_slice(payload);
+    chunk
+}
+
 /// Build the 0x944-byte payload for desktop-style replay (CMD 0x17d).
 /// Layout: 20-byte inner header (2, 0x82f, 8, 500 LE) then 0x930 body: channel (4), 32 zeros, path (1023), padding.
 pub fn build_desktop_replay_payload(channel_id: u8, path: &str) -> Vec<u8> {
@@ -129,7 +143,12 @@ pub fn build_download_by_time_payload(
     out[off + 20..off + 24].copy_from_slice(&(end_time.second as i32).to_le_bytes());
     off += 24;
     off += 4; // +0x5c: 4 bytes padding (already zeroed)
-    let path_len = save_path.as_bytes().len().min(SAVE_PATH_MAX);
+    let path_len = save_path
+        .char_indices()
+        .take_while(|(index, ch)| *index + ch.len_utf8() <= SAVE_PATH_MAX - 1)
+        .map(|(index, ch)| index + ch.len_utf8())
+        .last()
+        .unwrap_or(0);
     out[off..off + path_len].copy_from_slice(&save_path.as_bytes()[..path_len]);
     // +0x478: streamType (4 bytes)
     out[0x478..0x47c].copy_from_slice(&stream_type.to_le_bytes());
@@ -788,15 +807,33 @@ impl BcCamera {
         self.replay_seek(seq, seek_time.clone()).await?;
         log::info!("Replay: seek (MSG 123) done");
 
-        // Use parsed time as file start_time for MSG 5 when possible, to avoid MSG 13 (get_file_by_name)
-        // which some cameras (e.g. E1) reject with 400.
-        let start_time = if let Some(parsed) = parse_seek_time_from_name(name) {
-            parsed
-        } else {
-            let file_info = self
-                .get_file_by_name(name, 0, play_speed, stream_type)
-                .await?;
-            file_info.start_time.clone().ok_or_else(|| {
+        // Read camera-specific file metadata when available. Some models reject MSG 13,
+        // so fall back to the timestamp in the filename and UID 0 for those cameras.
+        let filename_start_time = parse_seek_time_from_name(name);
+        let file_info = match self
+            .get_file_by_name(name, 0, play_speed, stream_type)
+            .await
+        {
+            Ok(info) => Some(info),
+            Err(
+                e @ Error::CameraServiceUnavailable {
+                    id: MSG_ID_REPLAY_FILE_BY_NAME,
+                    code: 400 | 405,
+                },
+            ) if filename_start_time.is_some() => {
+                log::debug!(
+                    "Replay: MSG 13 metadata unavailable; using filename metadata: {}",
+                    e
+                );
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        let replay_uid = file_info.as_ref().and_then(|info| info.uid).unwrap_or(0);
+        let start_time = file_info
+            .and_then(|info| info.start_time)
+            .or(filename_start_time)
+            .ok_or_else(|| {
                 Error::UnintelligibleReply {
                     _reply: std::sync::Arc::new(Box::new(Bc::new_from_meta(BcMeta {
                         msg_id: 0,
@@ -808,8 +845,7 @@ impl BcCamera {
                     }))),
                     why: "FileInfo from camera had no startTime",
                 }
-            })?
-        };
+            })?;
 
         log::info!("Replay: start_time {:04}-{:02}-{:02} {:02}:{:02}:{:02}", start_time.year, start_time.month, start_time.day, start_time.hour, start_time.minute, start_time.second);
         let connection = self.get_connection();
@@ -859,7 +895,7 @@ impl BcCamera {
 
             let support_sub = if stream_type.as_str() == "subStream" { 1 } else { 0 };
             let file_info = FileInfo {
-                uid: Some(0),
+                uid: Some(replay_uid),
                 id: None,
                 name: Some(name.clone()),
                 channel_id: Some(channel_id),
@@ -959,7 +995,9 @@ impl BcCamera {
                         );
                         if first {
                             first = false;
-                            if msg.meta.response_code == 400 && msg_id == MSG_ID_REPLAY_START {
+                            if matches!(msg.meta.response_code, 400 | 405)
+                                && msg_id == MSG_ID_REPLAY_START
+                            {
                                 // Camera rejected MSG 5; try MSG 8 (e.g. E1).
                                 log::info!(
                                     "Replay: camera returned 400 for MSG 5, trying MSG 8..."
@@ -993,7 +1031,9 @@ impl BcCamera {
                                 first = true;
                                 continue 'recv_loop;
                             }
-                            if msg.meta.response_code == 400 && msg_id == MSG_ID_REPLAY_START_ALT {
+                            if matches!(msg.meta.response_code, 400 | 405)
+                                && msg_id == MSG_ID_REPLAY_START_ALT
+                            {
                                 // Camera rejected MSG 8; try desktop binary replay (CMD 0x17d, 0x944 payload).
                                 log::info!(
                                     "Replay: camera returned 400 for MSG 8, trying desktop replay (0x17d)..."
@@ -1246,11 +1286,25 @@ impl BcCamera {
         let start_msg_num = self.new_message_num();
         let stop_msg_num = self.new_message_num();
         let channel_id = self.channel_id;
-        let uid = [0u8; 32];
+        // MSG 143 identifies both the device and the logical channel in its binary payload.
+        // Zero-filled placeholders happen to work with some cameras but are rejected by others.
+        let uid = self.uid().await?;
+        if uid.is_empty() {
+            return Err(Error::InvalidArgument {
+                argument: "camera_uid".to_string(),
+                value: "the camera returned an empty UID".to_string(),
+            });
+        }
+        let logic_chn_bitmap = 1u64
+            .checked_shl(u32::from(channel_id))
+            .ok_or_else(|| Error::InvalidArgument {
+                argument: "channel_id".to_string(),
+                value: format!("{} cannot be represented in logicChnBitmap", channel_id),
+            })?;
         let payload = build_download_by_time_payload(
             channel_id,
-            &uid[..],
-            0,
+            uid.as_bytes(),
+            logic_chn_bitmap,
             &start_time,
             &end_time,
             save_path,
@@ -1307,6 +1361,7 @@ impl BcCamera {
             let mut codec = BcMediaCodex::new(strict);
             let mut buf = BytesMut::new();
             let mut raw_replay_mode = false;
+            let mut pending_first_chunk: Option<Vec<u8>> = None;
             let mut packet_count = 0u32;
             let mut total_binary_bytes = 0usize;
             let mut accepted_stream_response_codes: HashSet<u16> = HashSet::new();
@@ -1387,30 +1442,51 @@ impl BcCamera {
                                 const REPLAY_HEADER_LEN: usize = 32;
                                 if data.len() == REPLAY_HEADER_LEN {
                                     log::info!("DownloadByTime: skipping 32-byte stream info");
-                                } else {
-                                    buf.extend_from_slice(data);
-                                }
-                            } else {
-                                if packet_count == 2 && data.len() >= 8 && data[4..8] == *b"ftyp" {
+                                } else if data.len() >= 8 && data[4..8] == *b"ftyp" {
                                     raw_replay_mode = true;
-                                    log::info!("DownloadByTime: stream is MP4, forwarding raw bytes");
-                                }
-                                if raw_replay_mode {
-                                    let payload = strip_e1_replay_envelope(data);
-                                    if packet_count <= 3 {
-                                        log::debug!(
-                                            "E1 strip (DownloadByTime): pkt={} data_len={} payload_len={} data_first_64={:02x?} payload_first_64={:02x?}",
-                                            packet_count,
-                                            data.len(),
-                                            payload.len(),
-                                            &data[..data.len().min(64)],
-                                            &payload[..payload.len().min(64)]
-                                        );
-                                    }
-                                    if tx.send(Ok(BcMedia::RawReplayChunk(payload.to_vec()))).await.is_err() {
+                                    log::info!("DownloadByTime: stream starts with MP4 data");
+                                    let chunk = replay_raw_chunk(data);
+                                    if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
                                         break 'recv_loop;
                                     }
                                 } else {
+                                    pending_first_chunk = Some(data.to_vec());
+                                }
+                            } else {
+                                if packet_count == 2 && !raw_replay_mode {
+                                    if data.len() >= 8 && data[4..8] == *b"ftyp" {
+                                        raw_replay_mode = true;
+                                        log::info!("DownloadByTime: stream is MP4, forwarding raw bytes");
+                                    } else if data.len() > 512 {
+                                        raw_replay_mode = true;
+                                        log::info!("DownloadByTime: large non-BcMedia packet, forwarding raw data");
+                                    }
+                                }
+                                if raw_replay_mode {
+                                    if let Some(first_chunk) = pending_first_chunk.take() {
+                                        let chunk = replay_raw_chunk(&first_chunk);
+                                        if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
+                                            break 'recv_loop;
+                                        }
+                                    }
+                                    let chunk = replay_raw_chunk(data);
+                                    if packet_count <= 3 {
+                                        log::debug!(
+                                            "DownloadByTime raw chunk: pkt={} data_len={} payload_len={} data_first_64={:02x?} payload_first_64={:02x?}",
+                                            packet_count,
+                                            data.len(),
+                                            chunk.len(),
+                                            &data[..data.len().min(64)],
+                                            &chunk[..chunk.len().min(64)]
+                                        );
+                                    }
+                                    if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
+                                        break 'recv_loop;
+                                    }
+                                } else {
+                                    if let Some(first_chunk) = pending_first_chunk.take() {
+                                        buf.extend_from_slice(&first_chunk);
+                                    }
                                     buf.extend_from_slice(data);
                                     while let Some(bc_media) = codec.decode(&mut buf)? {
                                         if tx.send(Ok(bc_media)).await.is_err() {
