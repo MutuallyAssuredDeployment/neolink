@@ -1219,8 +1219,7 @@ impl BcCamera {
         let stop_msg_num = self.new_message_num();
         let channel_id = self.channel_id;
         let xml = download_by_time_xml(channel_id, stream_type, start_time, end_time)?;
-        let mut sub = connection.subscribe(MSG_ID_DOWNLOAD_BY_TIME, start_msg_num).await?;
-        sub.send(Bc {
+        let start_msg = Bc {
             meta: BcMeta {
                 msg_id: MSG_ID_DOWNLOAD_BY_TIME,
                 channel_id,
@@ -1233,21 +1232,44 @@ impl BcCamera {
                 extension: None,
                 payload: Some(BcPayloads::BcXml(xml)),
             }),
-        }).await?;
-        // Check acceptance before returning so callers can fall back for cameras
-        // that explicitly reject MSG 143. Preserve an initial binary response.
-        let first_msg = tokio::time::timeout(std::time::Duration::from_secs(15), sub.recv()).await??;
-        if first_msg.meta.response_code != 200 {
-            return Err(Error::CameraServiceUnavailable {
-                id: MSG_ID_DOWNLOAD_BY_TIME,
-                code: first_msg.meta.response_code,
-            });
-        }
-        log::info!("DownloadByTime: camera accepted MSG 143 XML, receiving BcMedia");
+        };
         let (tx, rx) = channel(if buffer_size == 0 { 100 } else { buffer_size });
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
         let abort_handle = CancellationToken::new();
         let abort_handle_thread = abort_handle.clone();
         let handle = task::spawn(async move {
+            // The task owns the connection; create its borrowing subscription here.
+            // Keep the same subscription through startup and media reception so no
+            // packets are lost between acceptance and returning the stream.
+            let started: Result<_> = async {
+                let mut sub = connection.subscribe(MSG_ID_DOWNLOAD_BY_TIME, start_msg_num).await?;
+                sub.send(start_msg).await?;
+                let first_msg = tokio::time::timeout(
+                    std::time::Duration::from_secs(15), sub.recv()
+                ).await??;
+                if first_msg.meta.response_code != 200 {
+                    return Err(Error::CameraServiceUnavailable {
+                        id: MSG_ID_DOWNLOAD_BY_TIME,
+                        code: first_msg.meta.response_code,
+                    });
+                }
+                Ok((sub, first_msg))
+            }.await;
+            let (mut sub, first_msg) = match started {
+                Ok(started) => {
+                    log::info!("DownloadByTime: camera accepted MSG 143 XML, receiving BcMedia");
+                    if ready_tx.send(Ok(())).is_err() {
+                        // The caller disappeared during startup. Stop the accepted
+                        // download through the normal cancellation/cleanup path.
+                        abort_handle_thread.cancel();
+                    }
+                    started
+                }
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err.clone()));
+                    return Err(err);
+                }
+            };
             let result: Result<()> = async {
                 let mut dump_file = match dump_replay {
                     Some(path) => Some(tokio::fs::File::create(path).await?),
@@ -1351,6 +1373,9 @@ impl BcCamera {
             }
             result
         });
+        // Preserve startup errors for callers that fall back when MSG 143 is
+        // rejected, while the task retains ownership of the connection.
+        ready_rx.await.map_err(|_| Error::DroppedSubscriber)??;
         Ok(StreamData::from_parts(handle, rx, abort_handle))
     }
 
