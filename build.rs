@@ -1,4 +1,5 @@
 use std::env;
+use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
@@ -7,6 +8,13 @@ fn main() {
 }
 
 fn build_ver() {
+    // Cargo reruns build scripts when a tracked path is missing. Deliberately
+    // never create this file: refresh the Git version on every build, even if
+    // only the current commit changed and all source files stayed the same.
+    let always_rebuild = PathBuf::from(env::var_os("OUT_DIR").unwrap())
+        .join("neolink-version-always-rebuild");
+    println!("cargo:rerun-if-changed={}", always_rebuild.display());
+
     let cargo_ver = env::var("CARGO_PKG_VERSION").unwrap();
     let commit = git_cmd_commit().unwrap_or("unknown commit".to_string());
     let version = git_ver().unwrap_or(cargo_ver);
@@ -23,18 +31,14 @@ fn git_ver() -> Option<String> {
 }
 
 fn git_cmd_ver() -> Option<String> {
-    let mut git_cmd = Command::new("git");
-    git_cmd.args(["describe", "--tags"]);
-
-    if let Some(true) = git_cmd.status().ok().map(|exit| exit.success()) {
-        println!("cargo:rerun-if-changed=.git/HEAD");
-        git_cmd
-            .output()
-            .ok()
-            .map(|o| String::from_utf8(o.stdout).unwrap())
-    } else {
-        None
+    let output = Command::new("git")
+        .args(["describe", "--tags"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
 }
 
 /// Attempts to retrieve the current Git commit hash (HEAD) of the repository.
