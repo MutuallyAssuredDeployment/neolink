@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<body>
+<FileInfoList version="1.1">
+<FileInfo>
+<channelId>0</channelId>
+<supportSub>1</supportSub>
+<streamType>subStream</streamType>
+<startTime>
+<year>2026</year>
+<month>11</month>
+<day>12</day>
+<hour>15</hour>
+<minute>38</minute>
+<second>14</second>
+</startTime>
+<endTime>
+<year>2026</year>
+<month>11</month>
+<day>12</day>
+<hour>15</hour>
+<minute>38</minute>
+<second>26</second>
+</endTime>
+</FileInfo>
+</FileInfoList>
+</body>

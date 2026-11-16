@@ -942,34 +942,8 @@ async fn run_replay_or_download(
         stream_type,
         speed
     );
-    // If writing to file and no --duration, try to get duration from file list (seek + list files by day).
-    let mut duration = duration;
-    if duration.is_none() && output.is_some() {
-        let auto_secs = camera
-            .run_task(|cam| {
-                let name = name.to_string();
-                let stream_type = stream_type.to_string();
-                let record_type = cmdline::FILE_SEARCH_RECORD_TYPES.to_string();
-                Box::pin(async move {
-                    cam.get_replay_file_duration_secs(&name, &stream_type, &record_type)
-                        .await
-                        .map_err(anyhow::Error::msg)
-                })
-            })
-            .await
-            .ok()
-            .flatten();
-        if let Some(secs) = auto_secs {
-            log::info!(
-                "Replay: file duration {} s (from file list), will stop when complete",
-                secs
-            );
-            duration = Some(secs);
-        }
-    }
-    if duration.is_none() {
-        log::info!("Replay: no --duration set; camera will stream until you stop or send response 300. Use --duration N to record N seconds then close.");
-    }
+    // --duration is an explicit wall-clock limit. Recording duration describes
+    // media time and must not stop a download while data is still in flight.
     // Get file metadata (size, record_type with AI tags, timing) from file list.
     let file_meta: Option<FileInfo> = camera
         .run_task(|cam| {
@@ -977,7 +951,10 @@ async fn run_replay_or_download(
             let stream_type = stream_type.to_string();
             let record_type = cmdline::FILE_SEARCH_RECORD_TYPES.to_string();
             Box::pin(async move {
-                let meta = cam.get_replay_file_metadata(&name, &stream_type, &record_type).await.ok().flatten();
+                let meta = match cam.get_replay_file_metadata(&name, &stream_type, &record_type).await {
+                    Ok(Some(info)) => Some(info),
+                    _ => cam.get_file_by_name(&name, 0, speed, &stream_type).await.ok(),
+                };
                 Ok(meta)
             })
         })
@@ -990,7 +967,7 @@ async fn run_replay_or_download(
         if l == 0 && h == 0 { None } else { Some(l + (h << 32)) }
     });
     if let Some(sz) = expected_size {
-        log::info!("Replay: expected file size {} bytes (from file list), will stop when complete", sz);
+        log::info!("Replay: stored file size {} bytes (transfer size may differ)", sz);
     }
     // Build recording metadata for MP4 embedding
     let recording_meta = RecordingMeta {
@@ -1003,16 +980,42 @@ async fn run_replay_or_download(
         log::info!("Replay: file recordType = {}", rt);
     }
     let dump_limit = dump_replay.as_ref().and_then(|_| Some(dump_replay_limit.unwrap_or(131072)));
-    let mut stream = camera
+    let time_range = if is_download {
+        file_meta.as_ref().and_then(|f| Some((f.start_time.clone()?, f.end_time.clone()?)))
+    } else {
+        None
+    };
+    let (mut stream, by_time) = camera
         .run_task(|cam| {
             let name = name.to_string();
             let stream_type = stream_type.to_string();
             let dump_path = dump_replay.clone();
             let expected_size = expected_size;
             let limit = dump_limit;
+            let time_range = time_range.clone();
             Box::pin(async move {
+                if let Some((start, end)) = time_range {
+                    let stream_num = match stream_type.as_str() {
+                        "mainStream" => 0,
+                        "subStream" => 1,
+                        "externStream" => 2,
+                        other => anyhow::bail!("Unknown stream type: {}", other),
+                    };
+                    log::info!("Download: requesting MSG 143 for {} to {}",
+                        format_replay_datetime(&start), format_replay_datetime(&end));
+                    match cam.start_download_by_time(
+                        start, end, "", stream_num, false, 100, dump_path.clone(), limit,
+                    ).await {
+                        Ok(stream) => return Ok((stream, true)),
+                        Err(neolink_core::Error::CameraServiceUnavailable { id: 143, code: 400 | 405 }) => {
+                            log::info!("Download: camera rejects MSG 143; using replay fallback");
+                        }
+                        Err(err) => return Err(err).context("Could not start video download"),
+                    }
+                }
                 cam.start_replay(&name, &stream_type, speed, false, 100, dump_path, limit, expected_size)
                     .await
+                    .map(|stream| (stream, false))
                     .context("Could not start replay on camera")
             })
         })
@@ -1101,32 +1104,39 @@ async fn run_replay_or_download(
 
     // Send MSG 7 (replay stop). Use a short timeout so we don't hang if the camera
     // already closed the stream (e.g. after "no data for 15s").
-    log::info!("Replay: sending MSG 7 (stop) with {}s timeout", 5);
-    const REPLAY_STOP_TIMEOUT_SECS: u64 = 5;
-    let stop_start = std::time::Instant::now();
-    match tokio::time::timeout(
-        tokio::time::Duration::from_secs(REPLAY_STOP_TIMEOUT_SECS),
-        camera.run_task(|cam| {
-            let name = name.to_string();
-            Box::pin(
-                async move { cam.replay_stop(&name).await.context("Replay stop failed") },
-            )
-        }),
-    )
-    .await
-    {
-        Ok(Ok(())) => {
-            log::info!("Replay: MSG 7 (stop) completed successfully in {:?}", stop_start.elapsed());
+    if !by_time {
+        log::info!("Replay: sending MSG 7 (stop) with {}s timeout", 5);
+        const REPLAY_STOP_TIMEOUT_SECS: u64 = 5;
+        let stop_start = std::time::Instant::now();
+        match tokio::time::timeout(
+            tokio::time::Duration::from_secs(REPLAY_STOP_TIMEOUT_SECS),
+            camera.run_task(|cam| {
+                let name = name.to_string();
+                Box::pin(
+                    async move { cam.replay_stop(&name).await.context("Replay stop failed") },
+                )
+            }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                log::info!("Replay: MSG 7 (stop) completed successfully in {:?}", stop_start.elapsed());
+            }
+            Ok(Err(e)) => {
+                log::warn!("Replay: MSG 7 (stop) failed after {:?}: {:?}", stop_start.elapsed(), e);
+            }
+            Err(_) => {
+                log::warn!(
+                    "Replay: MSG 7 (stop) timed out after {}s (camera may have already closed stream)",
+                    REPLAY_STOP_TIMEOUT_SECS
+                );
+            }
         }
-        Ok(Err(e)) => {
-            log::warn!("Replay: MSG 7 (stop) failed after {:?}: {:?}", stop_start.elapsed(), e);
-        }
-        Err(_) => {
-            log::warn!(
-                "Replay: MSG 7 (stop) timed out after {}s (camera may have already closed stream)",
-                REPLAY_STOP_TIMEOUT_SECS
-            );
-        }
+    }
+    // Wait for protocol cleanup (MSG 144 for a download) before writing output.
+    stream.shutdown().await.context("Could not shut down replay/download stream")?;
+    if is_download && frames == 0 && raw_replay_buffer.is_empty() {
+        anyhow::bail!("Camera ended the download without any video data");
     }
     if let Some(p) = &output {
         if !raw_replay_buffer.is_empty() {
@@ -1234,8 +1244,12 @@ async fn run_download_by_time(
     dump_replay: Option<std::path::PathBuf>,
     dump_replay_limit: Option<usize>,
 ) -> Result<()> {
-    let stream_type_u32 = if stream_type == "subStream" { 1 } else { 0 };
-    let save_path = output.display().to_string();
+    let stream_type_u32 = match stream_type {
+        "mainStream" => 0,
+        "subStream" => 1,
+        "externStream" => 2,
+        other => anyhow::bail!("Unknown stream type: {}", other),
+    };
     const DEFAULT_DUMP_LIMIT: usize = 131072;
     let dump_limit = dump_replay.as_ref().map(|_| dump_replay_limit.unwrap_or(DEFAULT_DUMP_LIMIT));
 
@@ -1258,14 +1272,13 @@ async fn run_download_by_time(
         .run_task(|cam| {
             let start_time = start_time.clone();
             let end_time = end_time.clone();
-            let save_path = save_path.clone();
             let dump_path = dump_replay.clone();
             let limit = dump_limit;
             Box::pin(async move {
                 cam.start_download_by_time(
                     start_time,
                     end_time,
-                    &save_path,
+                    "",
                     stream_type_u32,
                     false,
                     100,
@@ -1353,7 +1366,7 @@ async fn run_download_by_time(
         }
     }
 
-    drop(stream); // sends MSG 144
+    stream.shutdown().await.context("Could not stop download (MSG 144)")?;
 
     if !raw_replay_buffer.is_empty() {
         let stream = stream_for_mp4_assembly(&raw_replay_buffer, None);
@@ -1611,7 +1624,7 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             dump_replay_limit,
         } => {
             log::info!(
-                "Replay download: name={} stream={} (stops on response 300 or --duration)",
+                "Replay download: name={} stream={} (MSG 143; stops on camera end response or explicit --duration)",
                 name,
                 stream_type
             );

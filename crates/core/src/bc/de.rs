@@ -93,8 +93,14 @@ fn bc_modern_msg<'a>(
     // If missing payload_offset treat all as payload
     let ext_len = header.payload_offset.unwrap_or_default();
 
+    let payload_len = header.body_len.checked_sub(ext_len).ok_or_else(|| {
+        Err::Error(make_error(
+            buf,
+            "Payload offset exceeds body length",
+            ErrorKind::Verify,
+        ))
+    })?;
     let (buf, ext_buf) = take(ext_len)(buf)?;
-    let payload_len = header.body_len - ext_len;
     let (buf, payload_buf) = take(payload_len)(buf)?;
 
     let decrypted;
@@ -176,21 +182,31 @@ fn bc_modern_msg<'a>(
             _ => context.get_encrypted(),
         };
 
-        let processed_payload_buf =
-            encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
         if context.in_bin_mode.borrow().contains(&(header.msg_num)) || in_binary {
             payload = match (context.get_encrypted(), encrypted_len) {
                 (EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
-                    // if if context.debug {
-                    //     log::trace!("Binary: {:X?}", &processed_payload_buf[0..30]);
-                    // }
-                    Some(BcPayloads::Binary(
-                        processed_payload_buf[0..(encrypted_len as usize)].to_vec(),
-                    ))
+                    // encryptLen describes an encrypted prefix, not the total
+                    // payload length. Continuation bytes remain unencrypted.
+                    let encrypted_len = encrypted_len as usize;
+                    if encrypted_len > payload_buf.len() {
+                        return Err(Err::Error(make_error(
+                            buf,
+                            "encryptLen exceeds payload length",
+                            ErrorKind::Verify,
+                        )));
+                    }
+                    let mut data = encryption_protocol.decrypt(
+                        header.channel_id as u32,
+                        &payload_buf[..encrypted_len],
+                    );
+                    data.extend_from_slice(&payload_buf[encrypted_len..]);
+                    Some(BcPayloads::Binary(data))
                 }
                 _ => Some(BcPayloads::Binary(payload_buf.to_vec())),
             };
         } else {
+            let processed_payload_buf =
+                encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
             if context.debug {
                 println!(
                     "Payload Txt: {:?}",
@@ -260,6 +276,59 @@ mod tests {
     use crate::bc::xml::*;
     use assert_matches::assert_matches;
     use env_logger::Env;
+    use std::convert::TryInto;
+
+    #[test]
+    fn replay_opaque_class_keeps_offset_and_unencrypted_tail() {
+        // Captured Argus 4 Pro header layout, neutral key and synthetic media.
+        // Includes an encrypted prefix followed by an unencrypted continuation.
+        let sample = include_bytes!("samples/replay_partial_aes.bin");
+        let context = BcContext::new_with_encryption(
+            EncryptionProtocol::full_aes(*b"test replay key!"),
+        );
+        let mut buf = BytesMut::from(&sample[..]);
+        buf.extend_from_slice(sample);
+        let mut expected = b"01dcH264".to_vec();
+        expected.extend_from_slice(&[0; 24]);
+        expected.extend_from_slice(b"unencrypted continuation");
+        for _ in 0..2 {
+            let msg = Bc::deserialize(&context, &mut buf).unwrap();
+            assert_eq!(msg.meta.class, 0x6afb);
+            assert_eq!(msg.meta.response_code, 0x5070);
+            match msg.body {
+                BcBody::ModernMsg(ModernMsg {
+                    extension: Some(ext), payload: Some(BcPayloads::Binary(data)),
+                }) => {
+                    assert_eq!(ext.encrypt_len, Some(32));
+                    assert_eq!(data, expected);
+                }
+                other => panic!("Expected decrypted binary replay: {:?}", other),
+            }
+        }
+        assert!(buf.is_empty(), "Each 24-byte header must be consumed completely");
+    }
+
+    #[test]
+    fn replay_rejects_encrypt_len_larger_than_payload() {
+        let mut sample = include_bytes!("samples/replay_partial_aes.bin").to_vec();
+        let ext_len = u32::from_le_bytes(sample[20..24].try_into().unwrap()) as usize;
+        sample.truncate(24 + ext_len + 16);
+        sample[8..12].copy_from_slice(&((ext_len + 16) as u32).to_le_bytes());
+        let context = BcContext::new_with_encryption(
+            EncryptionProtocol::full_aes(*b"test replay key!"),
+        );
+        assert!(matches!(Bc::deserialize(&context, &mut BytesMut::from(&sample[..])),
+            Err(Error::NomError(_))));
+    }
+
+    #[test]
+    fn replay_rejects_payload_offset_larger_than_body() {
+        let mut sample = include_bytes!("samples/replay_partial_aes.bin").to_vec();
+        sample[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
+        assert!(matches!(Bc::deserialize(&context, &mut BytesMut::from(&sample[..])),
+            Err(Error::NomError(_))));
+    }
 
     fn init() {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))

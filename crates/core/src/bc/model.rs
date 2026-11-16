@@ -411,6 +411,8 @@ impl BcHeader {
 }
 
 pub(super) fn has_payload_offset(class: u16) -> bool {
-    // See BcHeader::is_modern() for a description of which packets have the bin offset
-    class == 0x6414 || class == 0x0000
+    // Only the legacy login and its negotiation reply use a 20-byte header.
+    // Replay packets may carry an opaque value in the status/class word, but
+    // still have the payload offset at byte 20 (e.g. Argus 4 Pro class 0x6afb).
+    !matches!(class, 0x6514 | 0x6614)
 }

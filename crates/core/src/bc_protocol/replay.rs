@@ -1,4 +1,4 @@
-//! SD card replay: day records, file list, seek, start/stop playback (MSG 142, 14, 15, 13, 123, 5, 7).
+//! SD card replay and download: file lists, playback, and XML time-range download (MSG 143/144).
 //!
 //! Desktop app (FUN_180177b80) sends CMD 0x17d with a 0x944-byte payload: 20-byte inner header
 //! then 0x930 body (channel, 32 zeros, path 0x3ff). Use MSG_ID_REPLAY_DESKTOP when MSG 8 returns 400.
@@ -9,8 +9,7 @@
 
 use super::stream::StreamData;
 use super::{BcCamera, Error, Result};
-use std::collections::HashSet;
-use std::convert::{TryFrom, TryInto};
+use std::convert::TryFrom;
 use crate::bc::{
     model::*,
     xml::{
@@ -69,18 +68,83 @@ fn strip_e1_replay_envelope(data: &[u8]) -> &[u8] {
     data
 }
 
-/// Remove a per-packet E1 envelope and make standalone H.264 NALs Annex B compatible.
-fn replay_raw_chunk(data: &[u8]) -> Vec<u8> {
-    let payload = strip_e1_replay_envelope(data);
-    let nal_type = payload.first().map(|byte| byte & 0x1f).unwrap_or(0);
-    let is_video_nal = matches!(nal_type, 1 | 5 | 6 | 7 | 8 | 9);
-    let has_start_code = payload.starts_with(&[0, 0, 0, 1]) || payload.starts_with(&[0, 0, 1]);
-    let mut chunk = Vec::with_capacity(payload.len() + 4);
-    if is_video_nal && !has_start_code {
-        chunk.extend_from_slice(&[0, 0, 0, 1]);
+/// Decode decrypted replay/download payloads; BcMedia frames can span BC messages.
+struct ReplayDecoder {
+    codec: BcMediaCodex,
+    buffer: BytesMut,
+    container: bool,
+    decoded_media: bool,
+}
+
+impl ReplayDecoder {
+    fn new(strict: bool) -> Self {
+        Self {
+            codec: BcMediaCodex::new(strict),
+            buffer: BytesMut::new(),
+            container: false,
+            decoded_media: false,
+        }
     }
-    chunk.extend_from_slice(payload);
-    chunk
+
+    fn decode(&mut self, data: &[u8]) -> Result<Vec<BcMedia>> {
+        let data = strip_e1_replay_envelope(data);
+        // Positive MP4 detection only. Large I-frames are ordinary BcMedia.
+        if !self.decoded_media && self.buffer.len() <= 32
+            && data.len() >= 8 && &data[4..8] == b"ftyp"
+        {
+            self.container = true;
+            self.buffer.clear();
+        }
+        if self.container {
+            return Ok(vec![BcMedia::RawReplayChunk(data.to_vec())]);
+        }
+        self.buffer.extend_from_slice(data);
+        let mut frames = Vec::new();
+        while let Some(frame) = self.codec.decode(&mut self.buffer)? {
+            self.decoded_media |= !matches!(&frame, BcMedia::InfoV1(_) | BcMedia::InfoV2(_));
+            frames.push(frame);
+        }
+        Ok(frames)
+    }
+}
+
+/// MSG 143 uses FileInfoList XML on the wire, rather than the native SDK's
+/// BC_DOWNLOAD_BY_TIME_INFO struct. The client's output path is local only.
+fn download_by_time_xml(
+    channel_id: u8,
+    stream_type: u32,
+    start_time: ReplayDateTime,
+    end_time: ReplayDateTime,
+) -> Result<BcXml> {
+    let stream = match stream_type {
+        0 => "mainStream",
+        1 => "subStream",
+        2 => "externStream",
+        _ => return Err(Error::InvalidArgument {
+            argument: "stream_type".to_string(),
+            value: stream_type.to_string(),
+        }),
+    };
+    if replay_datetime_duration_secs(&start_time, &end_time).is_none() {
+        return Err(Error::InvalidArgument {
+            argument: "time_range".to_string(),
+            value: "invalid start/end time or end before start".to_string(),
+        });
+    }
+    Ok(BcXml {
+        file_info_list: Some(FileInfoList {
+            version: Some(xml_ver()),
+            file_info: vec![FileInfo {
+                channel_id: Some(channel_id),
+                support_sub: Some(u8::from(stream_type == 1)),
+                stream_type: Some(stream.to_string()),
+                start_time: Some(start_time),
+                end_time: Some(end_time),
+                ..Default::default()
+            }],
+        }),
+        ..Default::default()
+    })
 }
 
 /// Build the 0x944-byte payload for desktop-style replay (CMD 0x17d).
@@ -107,7 +171,8 @@ pub fn build_desktop_replay_payload(channel_id: u8, path: &str) -> Vec<u8> {
 pub const BC_DOWNLOAD_BY_TIME_INFO_SIZE: usize = 0x480;
 const SAVE_PATH_MAX: usize = 1024; // cSaveFileName at +0x60, max 1024 bytes
 
-/// Build the 0x480-byte BC_DOWNLOAD_BY_TIME_INFO payload for download-by-time (MSG 143).
+/// Build the native SDK's 0x480-byte BC_DOWNLOAD_BY_TIME_INFO struct.
+/// This struct is not the XML payload sent over the wire by MSG 143.
 /// Layout: iChannel (4), cUID (32), logicChnBitmap (8), startTime (6×i32), endTime (6×i32),
 /// padding (4), cSaveFileName (1024), fileSize/curSize/processed (8 each), streamType (4), padding (4).
 pub fn build_download_by_time_payload(
@@ -654,7 +719,7 @@ impl BcCamera {
     }
 
     /// Get file metadata (duration, size) from the file list for a given replay file name.
-    /// Does seek for the file's day, then fetches the file list and finds the matching entry.
+    /// Fetches the file list for the file's day and finds the matching entry.
     /// Returns None if the name cannot be parsed (no date) or the file is not in the list.
     pub async fn get_replay_file_metadata(
         &self,
@@ -678,11 +743,6 @@ impl BcCamera {
             second: 59,
             ..seek_time
         };
-        let seq = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs() as u32)
-            .unwrap_or(0);
-        self.replay_seek(seq, day_start.clone()).await?;
         let handle_info = self
             .get_file_list_handle(stream_type, record_type, day_start, day_end)
             .await?;
@@ -766,15 +826,15 @@ impl BcCamera {
         }
     }
 
-    /// Start replay playback (MSG 5). Returns a stream of BCMedia; when dropped, sends stop (MSG 7).
+    /// Start replay playback (MSG 5). The caller sends replay_stop (MSG 7)
+    /// and shuts down the returned stream when finished.
     ///
     /// Caller should have obtained `name` from `get_file_list_by_handle`. The protocol requires
     /// ReplaySeek (MSG 123) before get_file_by_name (MSG 13); we parse seek time from the
     /// filename (e.g. `01_20260204120000` → 2026-02-04 12:00:00) when possible.
     ///
-    /// If `expected_size` is set (e.g. from file list size_l/size_h), or the 32-byte replay
-    /// header contains a plausible size at +0x10/+0x18 (per BaichuanDownloader RE), we stop when
-    /// payload bytes received reach that size, since some cameras (e.g. E1) never send response 300.
+    /// File-list sizes describe the stored file, which can differ from BcMedia
+    /// transfer bytes. Only an end response or inactivity completes replay.
     pub async fn start_replay(
         &self,
         name: &str,
@@ -784,7 +844,7 @@ impl BcCamera {
         buffer_size: usize,
         dump_replay: Option<std::path::PathBuf>,
         dump_replay_limit: Option<usize>,
-        expected_size: Option<u64>,
+        _expected_size: Option<u64>,
     ) -> Result<StreamData> {
         let seq = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -854,7 +914,6 @@ impl BcCamera {
         let name = name.to_string();
         let stream_type = stream_type.to_string();
         let dump_path = dump_replay;
-        let expected_size = expected_size;
 
         let buffer_size = if buffer_size == 0 { 100 } else { buffer_size };
         const DEFAULT_DUMP_LIMIT: usize = 131072;
@@ -864,7 +923,7 @@ impl BcCamera {
         let abort_handle_thread = abort_handle.clone();
 
         let handle = task::spawn(async move {
-            // Optional dump of replay stream (after 32-byte header). limit 0 = full stream.
+            // Optional dump of decrypted BcMedia/container data. Limit 0 = full stream.
             let mut dump_file = None::<(tokio::fs::File, Option<usize>)>;
             if let Some(ref p) = dump_path {
                 match tokio::fs::File::create(p).await {
@@ -875,7 +934,7 @@ impl BcCamera {
                             format!("first {} bytes", dump_limit)
                         };
                         log::info!(
-                            "Replay: will dump {} of raw replay data (after 32-byte header) to {}",
+                            "Replay: will dump {} of decrypted replay data to {}",
                             limit_str,
                             p.display()
                         );
@@ -936,19 +995,9 @@ impl BcCamera {
             log::info!("Replay: MSG {} sent, waiting for first response...", msg_id);
 
             let mut first = true;
-            let mut codec = BcMediaCodex::new(strict);
-            let mut buf = BytesMut::new();
-            // When set, camera sends MP4 (or other container) instead of BcMedia; forward raw bytes.
-            let mut raw_replay_mode = false;
-            // First packet (32 bytes) may be replay header or start of file; keep and send when entering raw mode so client has full stream.
-            let mut pending_first_chunk: Option<Vec<u8>> = None;
-
+            let mut decoder = ReplayDecoder::new(strict);
             let mut packet_count = 0u32;
             let mut total_binary_bytes = 0usize;
-            // App only writes binary when response_code matches expected. Some cameras (e.g. E1) use 200 for accept then 54778 (0xD5DA) for streaming; accept any code we've seen with binary.
-            let mut accepted_stream_response_codes: HashSet<u16> = HashSet::new();
-            // End when payload (excluding 32-byte header) reaches this size. From file list or 32-byte header (RE: BaichuanDownloader 0xe48 / header +0x10, +0x18).
-            let mut expected_payload_size = expected_size;
             const RECV_TIMEOUT_SECS: u64 = 15;
             let recv_timeout = tokio::time::Duration::from_secs(RECV_TIMEOUT_SECS);
             'recv_loop: loop {
@@ -961,7 +1010,10 @@ impl BcCamera {
                                     "Replay: no data for {}s (camera may have stopped without 300), finishing ({} packets, {} bytes)",
                                     RECV_TIMEOUT_SECS, packet_count, total_binary_bytes
                                 );
-                                let _ = tx.send(Ok(BcMedia::StreamEnd)).await;
+                                tokio::select! {
+                                    _ = abort_handle_thread.cancelled() => {},
+                                    _ = tx.send(Ok(BcMedia::StreamEnd)) => {},
+                                }
                                 break 'recv_loop;
                             }
                             Ok(r) => r,
@@ -1039,6 +1091,7 @@ impl BcCamera {
                                     "Replay: camera returned 400 for MSG 8, trying desktop replay (0x17d)..."
                                 );
                                 drop(sub);
+                                msg_id = MSG_ID_REPLAY_DESKTOP;
                                 let sub_desktop = connection
                                     .subscribe(MSG_ID_REPLAY_DESKTOP, start_msg_num)
                                     .await?;
@@ -1074,8 +1127,7 @@ impl BcCamera {
                                 });
                             }
                             log::info!("Replay: camera accepted (200), streaming...");
-                            accepted_stream_response_codes.insert(200);
-                            // Tell consumer which msg_id was accepted so it can skip first 32 bytes only for MSG 5 (app parity).
+                            // Tell the consumer which replay request was accepted.
                             let _ = tx.send(Ok(BcMedia::ReplayStarted(msg_id as u16))).await;
                         } else if msg.meta.response_code == 300 || msg.meta.response_code == 331 {
                             // Camera signals end of file (300 = by-name; 331 = by-time). Notify consumer then stop.
@@ -1083,7 +1135,10 @@ impl BcCamera {
                                 "Replay/Download: response {} (end of file), stopping ({} packets, {} bytes)",
                                 msg.meta.response_code, packet_count, total_binary_bytes
                             );
-                            let _ = tx.send(Ok(BcMedia::StreamEnd)).await;
+                            tokio::select! {
+                                _ = abort_handle_thread.cancelled() => {},
+                                _ = tx.send(Ok(BcMedia::StreamEnd)) => {},
+                            }
                             break 'recv_loop;
                         }
                         if let BcBody::ModernMsg(ModernMsg {
@@ -1091,153 +1146,30 @@ impl BcCamera {
                             ..
                         }) = msg.body
                         {
-                            // Accept binary when response_code is in accepted set (200 from accept). E1 and others use a different code (e.g. 54778) for streaming; add it when first seen.
-                            let code = msg.meta.response_code;
-                            if !accepted_stream_response_codes.contains(&code) {
-                                if code == 300 || code == 331 {
-                                    // End codes handled above
-                                } else {
-                                    accepted_stream_response_codes.insert(code);
-                                    log::debug!("Replay: accepting streaming response_code {} (added to accepted set)", code);
-                                }
-                            }
-                            if accepted_stream_response_codes.contains(&code) {
                             packet_count += 1;
                             total_binary_bytes += data.len();
-
-                            // Dump stream (after 32-byte header). remaining None = unlimited.
                             if let Some((ref mut f, ref mut remaining)) = dump_file {
-                                if packet_count >= 2 {
-                                    let to_write = match *remaining {
-                                        None => data.len(),
-                                        Some(r) if r > 0 => data.len().min(r),
-                                        _ => 0,
-                                    };
-                                    if to_write > 0 {
-                                        if let Err(e) = f.write_all(&data[..to_write]).await {
-                                            log::warn!("Replay: dump write error: {}", e);
-                                            dump_file = None;
-                                        } else if let Some(ref mut r) = remaining {
-                                            *r -= to_write;
-                                            if *r == 0 {
-                                                let _ = f.flush().await;
-                                                log::info!("Replay: reached dump limit, closed dump file");
-                                                dump_file = None;
-                                            }
-                                        }
+                                let to_write = remaining.map_or(data.len(), |r| data.len().min(r));
+                                if to_write > 0 {
+                                    f.write_all(&data[..to_write]).await?;
+                                    if let Some(r) = remaining {
+                                        *r -= to_write;
                                     }
                                 }
                             }
-
-                            if packet_count == 1 {
-                                // Some cameras (e.g. E1) send a 32-byte replay header first; BcMedia
-                                // stream starts in the next packet. Skip the header so the codec
-                                // sees the real stream start. Keep it for raw mode so client gets full stream (may be ftyp).
-                                const REPLAY_HEADER_LEN: usize = 32;
-                                if data.len() == REPLAY_HEADER_LEN {
-                                    log::info!(
-                                        "Replay: skipping {} byte replay header (first packet)",
-                                        REPLAY_HEADER_LEN
-                                    );
-                                    log::debug!(
-                                        "Replay: header hex: {:02x?}",
-                                        &data[..data.len().min(64)]
-                                    );
-                                    pending_first_chunk = Some(data.to_vec());
-                                    // Parse possible file size from header (RE: 32-byte layout +0x10 uint64, +0x18 uint64; BaichuanDownloader uses fileSize at 0xe48).
-                                    if expected_payload_size.is_none() && data.len() >= 32 {
-                                        let size_at_10 = u64::from_le_bytes(data[16..24].try_into().unwrap());
-                                        let size_at_18 = u64::from_le_bytes(data[24..32].try_into().unwrap());
-                                        const MAX_PLAUSIBLE: u64 = 500_000_000;
-                                        if size_at_10 > 0 && size_at_10 <= MAX_PLAUSIBLE {
-                                            expected_payload_size = Some(size_at_10);
-                                            log::info!("Replay: using expected size from header +0x10: {} bytes", size_at_10);
-                                        } else if size_at_18 > 0 && size_at_18 <= MAX_PLAUSIBLE {
-                                            expected_payload_size = Some(size_at_18);
-                                            log::info!("Replay: using expected size from header +0x18: {} bytes", size_at_18);
-                                        }
-                                    }
-                                } else {
-                                    buf.extend_from_slice(&data);
-                                }
-                            } else {
-                                // Detect MP4 (ISO Base Media): first payload after header has "ftyp" at 4..8.
-                                if packet_count == 2 && data.len() >= 8 && data[4..8] == *b"ftyp" {
-                                    raw_replay_mode = true;
-                                    log::info!(
-                                        "Replay: stream is MP4/container format, forwarding raw bytes"
-                                    );
-                                }
-                                // Some cameras (e.g. E1 with MSG 5) send MP4 that doesn't start with ftyp after
-                                // decrypt, or use a different container; continuation packets can have
-                                // response_code != 200. Treat as raw replay to avoid codec Nom errors and connection loss.
-                                if packet_count == 2 && data.len() >= 8 && data[4..8] != *b"ftyp" && data.len() > 512 {
-                                    raw_replay_mode = true;
-                                    log::info!(
-                                        "Replay: packet 2 not ftyp (decrypted: {:02x?}), treating as container/raw",
-                                        &data[0..8.min(data.len())]
-                                    );
-                                }
-                                if raw_replay_mode {
-                                    if let Some(chunk) = pending_first_chunk.take() {
-                                        if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
-                                            break 'recv_loop;
-                                        }
-                                    }
-                                    let payload = strip_e1_replay_envelope(&data);
-                                    // E1 fix: raw replay (raw_replay_mode=true) often lacks start codes for NAL units (SPS/PPS/IDR/SLICE)
-                                    // if the camera sends them as individual messages (common for E1).
-                                    // If payload looks like a NAL (starts with valid NAL type) but has no start code, prepend one.
-                                    let mut chunk_data = Vec::with_capacity(payload.len() + 4);
-                                    let nal_type = if !payload.is_empty() { payload[0] & 0x1f } else { 0 };
-                                    // 1=Slice, 5=IDR, 6=SEI, 7=SPS, 8=PPS, 9=AUD
-                                    let is_video_nal = matches!(nal_type, 1 | 5 | 6 | 7 | 8 | 9);
-                                    let has_start_code = (payload.len() >= 4 && payload[0..4] == [0, 0, 0, 1])
-                                        || (payload.len() >= 3 && payload[0..3] == [0, 0, 1]);
-
-                                    if is_video_nal && !has_start_code {
-                                        // Insert Annex B start code so the raw stream is playable
-                                        chunk_data.extend_from_slice(&[0, 0, 0, 1]);
-                                    }
-                                    chunk_data.extend_from_slice(payload);
-
-                                    if tx.send(Ok(BcMedia::RawReplayChunk(chunk_data))).await.is_err() {
-                                        break 'recv_loop;
-                                    }
-                                } else {
-                                    if packet_count == 2 && data.len() >= 8 {
-                                        log::info!(
-                                            "Replay: packet 2 first 8 bytes (decrypted): {:02x?}",
-                                            &data[0..8]
-                                        );
-                                    }
-                                    buf.extend_from_slice(&data);
-                                    while let Some(bc_media) = codec.decode(&mut buf)? {
-                                        if tx.send(Ok(bc_media)).await.is_err() {
-                                            break 'recv_loop;
-                                        }
-                                    }
+                            for frame in decoder.decode(data)? {
+                                if tokio::select! {
+                                    _ = abort_handle_thread.cancelled() => true,
+                                    sent = tx.send(Ok(frame)) => sent.is_err(),
+                                } {
+                                    break 'recv_loop;
                                 }
                             }
                             if packet_count <= 3 || packet_count % 200 == 0 {
                                 log::info!(
                                     "Replay: {} packets, {} KB received",
-                                    packet_count,
-                                    total_binary_bytes / 1024
+                                    packet_count, total_binary_bytes / 1024
                                 );
-                            }
-                            // Size-based end: some cameras never send 300; stop when we have expected payload (RE: BaichuanDownloader curSize >= fileSize).
-                            let payload_bytes = total_binary_bytes.saturating_sub(32) as u64;
-                            if let Some(exp) = expected_payload_size {
-                                if payload_bytes >= exp {
-                                    log::info!(
-                                        "Replay: received {} bytes (expected {}), finishing",
-                                        payload_bytes, exp
-                                    );
-                                    let _ = tx.send(Ok(BcMedia::StreamEnd)).await;
-                                    break 'recv_loop;
-                                }
-                            }
                             }
                         } else {
                             log::info!(
@@ -1269,13 +1201,13 @@ impl BcCamera {
         Ok(StreamData::from_parts(handle, rx, abort_handle))
     }
 
-    /// Start download by time range (MSG 143). Returns a stream of BCMedia; when dropped, sends stop (MSG 144).
-    /// Same stream behaviour as replay: first packet 32 bytes = stream info (skipped), then binary data; end on response 331 (or 300).
+    /// Download BcMedia by time using MSG 143 FileInfoList XML. Ends on response
+    /// 300 or 331; MSG 144 is sent on completion, cancellation, or receive failure.
     pub async fn start_download_by_time(
         &self,
         start_time: ReplayDateTime,
         end_time: ReplayDateTime,
-        save_path: &str,
+        _save_path: &str,
         stream_type: u32,
         strict: bool,
         buffer_size: usize,
@@ -1286,242 +1218,139 @@ impl BcCamera {
         let start_msg_num = self.new_message_num();
         let stop_msg_num = self.new_message_num();
         let channel_id = self.channel_id;
-        // MSG 143 identifies both the device and the logical channel in its binary payload.
-        // Zero-filled placeholders happen to work with some cameras but are rejected by others.
-        let uid = self.uid().await?;
-        if uid.is_empty() {
-            return Err(Error::InvalidArgument {
-                argument: "camera_uid".to_string(),
-                value: "the camera returned an empty UID".to_string(),
+        let xml = download_by_time_xml(channel_id, stream_type, start_time, end_time)?;
+        let mut sub = connection.subscribe(MSG_ID_DOWNLOAD_BY_TIME, start_msg_num).await?;
+        sub.send(Bc {
+            meta: BcMeta {
+                msg_id: MSG_ID_DOWNLOAD_BY_TIME,
+                channel_id,
+                msg_num: start_msg_num,
+                stream_type: 0,
+                response_code: 0,
+                class: 0x6414,
+            },
+            body: BcBody::ModernMsg(ModernMsg {
+                extension: None,
+                payload: Some(BcPayloads::BcXml(xml)),
+            }),
+        }).await?;
+        // Check acceptance before returning so callers can fall back for cameras
+        // that explicitly reject MSG 143. Preserve an initial binary response.
+        let first_msg = tokio::time::timeout(std::time::Duration::from_secs(15), sub.recv()).await??;
+        if first_msg.meta.response_code != 200 {
+            return Err(Error::CameraServiceUnavailable {
+                id: MSG_ID_DOWNLOAD_BY_TIME,
+                code: first_msg.meta.response_code,
             });
         }
-        let logic_chn_bitmap = 1u64
-            .checked_shl(u32::from(channel_id))
-            .ok_or_else(|| Error::InvalidArgument {
-                argument: "channel_id".to_string(),
-                value: format!("{} cannot be represented in logicChnBitmap", channel_id),
-            })?;
-        let payload = build_download_by_time_payload(
-            channel_id,
-            uid.as_bytes(),
-            logic_chn_bitmap,
-            &start_time,
-            &end_time,
-            save_path,
-            stream_type,
-        );
-        let buffer_size = if buffer_size == 0 { 100 } else { buffer_size };
-        const DEFAULT_DUMP_LIMIT: usize = 131072;
-        let dump_limit = dump_replay_limit.unwrap_or(DEFAULT_DUMP_LIMIT);
-        let (tx, rx) = channel(buffer_size);
+        log::info!("DownloadByTime: camera accepted MSG 143 XML, receiving BcMedia");
+        let (tx, rx) = channel(if buffer_size == 0 { 100 } else { buffer_size });
         let abort_handle = CancellationToken::new();
         let abort_handle_thread = abort_handle.clone();
-
         let handle = task::spawn(async move {
-            let mut dump_file = None::<(tokio::fs::File, Option<usize>)>;
-            if let Some(ref p) = dump_replay {
-                if let Ok(f) = tokio::fs::File::create(p).await {
-                    let limit_str = if dump_limit == 0 {
-                        "full stream".to_string()
-                    } else {
-                        format!("first {} bytes", dump_limit)
+            let result: Result<()> = async {
+                let mut dump_file = match dump_replay {
+                    Some(path) => Some(tokio::fs::File::create(path).await?),
+                    None => None,
+                };
+                let mut dump_remaining = match dump_replay_limit.unwrap_or(131072) {
+                    0 => None,
+                    n => Some(n),
+                };
+                let mut decoder = ReplayDecoder::new(strict);
+                let mut pending = Some(first_msg);
+                let mut packets = 0u32;
+                let mut received_bytes = 0usize;
+                'recv_loop: loop {
+                    let msg = match pending.take() {
+                        Some(msg) => msg,
+                        None => tokio::select! {
+                            _ = abort_handle_thread.cancelled() => break 'recv_loop,
+                            msg = tokio::time::timeout(
+                                std::time::Duration::from_secs(15), sub.recv()
+                            ) => msg??,
+                        },
                     };
-                    log::info!(
-                        "DownloadByTime: will dump {} (after 32-byte header) to {}",
-                        limit_str,
-                        p.display()
-                    );
-                    dump_file = Some((f, if dump_limit == 0 { None } else { Some(dump_limit) }));
-                }
-            }
-            let mut sub = connection
-                .subscribe(MSG_ID_DOWNLOAD_BY_TIME, start_msg_num)
-                .await?;
-            let msg = Bc {
-                meta: BcMeta {
-                    msg_id: MSG_ID_DOWNLOAD_BY_TIME,
-                    channel_id,
-                    msg_num: start_msg_num,
-                    stream_type: 0,
-                    response_code: 0,
-                    class: 0x6414,
-                },
-                body: BcBody::ModernMsg(ModernMsg {
-                    extension: None,
-                    payload: Some(BcPayloads::Binary(payload)),
-                }),
-            };
-            log::info!(
-                "DownloadByTime: sending MSG 143 start_time {:?} end_time {:?}",
-                start_time, end_time
-            );
-            sub.send(msg).await?;
-
-            let mut first = true;
-            let mut codec = BcMediaCodex::new(strict);
-            let mut buf = BytesMut::new();
-            let mut raw_replay_mode = false;
-            let mut pending_first_chunk: Option<Vec<u8>> = None;
-            let mut packet_count = 0u32;
-            let mut total_binary_bytes = 0usize;
-            let mut accepted_stream_response_codes: HashSet<u16> = HashSet::new();
-            'recv_loop: loop {
-                tokio::select! {
-                    _ = abort_handle_thread.cancelled() => break 'recv_loop,
-                    msg_res = sub.recv() => {
-                        let msg = match msg_res {
-                            Err(e) => {
-                                log::info!(
-                                    "DownloadByTime stream ended: recv error ({} packets, {} bytes): {:?}",
-                                    packet_count, total_binary_bytes, e
-                                );
-                                log::info!(
-                                    "Download failed: verify protocol in Ghidra via MCP (see GHIDRA_CHECKLIST.md), do not guess"
-                                );
-                                return Err(e);
-                            }
-                            Ok(m) => m,
-                        };
-                        if first {
-                            first = false;
-                            if msg.meta.response_code != 200 {
-                                log::info!(
-                                    "DownloadByTime rejected: response_code={}",
-                                    msg.meta.response_code
-                                );
-                                return Err(Error::UnintelligibleReply {
-                                    _reply: std::sync::Arc::new(Box::new(msg)),
-                                    why: "Camera did not accept download-by-time start",
-                                });
-                            }
-                            accepted_stream_response_codes.insert(200);
-                            log::info!("DownloadByTime: camera accepted (200), streaming...");
-                        } else if msg.meta.response_code == 300 || msg.meta.response_code == 331 {
-                            log::info!(
-                                "DownloadByTime: response {} (end), stopping ({} packets, {} bytes)",
-                                msg.meta.response_code, packet_count, total_binary_bytes
-                            );
-                            let _ = tx.send(Ok(BcMedia::StreamEnd)).await;
-                            break 'recv_loop;
+                    if matches!(msg.meta.response_code, 300 | 331) {
+                        log::info!(
+                            "DownloadByTime: end response {}, {} packets, {} BcMedia bytes",
+                            msg.meta.response_code, packets, received_bytes
+                        );
+                        if !decoder.buffer.is_empty() {
+                            return Err(Error::UnintelligibleReply {
+                                _reply: std::sync::Arc::new(Box::new(msg)),
+                                why: "Download ended with an incomplete BcMedia frame",
+                            });
                         }
-                        if let BcBody::ModernMsg(ModernMsg {
-                            payload: Some(BcPayloads::Binary(ref data)),
-                            ..
-                        }) = msg.body
-                        {
-                            let code = msg.meta.response_code;
-                            if !accepted_stream_response_codes.contains(&code) {
-                                if code != 300 && code != 331 {
-                                    accepted_stream_response_codes.insert(code);
-                                    log::debug!("DownloadByTime: accepting streaming response_code {} (added to accepted set)", code);
-                                }
-                            }
-                            if accepted_stream_response_codes.contains(&code) {
-                            packet_count += 1;
-                            total_binary_bytes += data.len();
-                            if let Some((ref mut f, ref mut remaining)) = dump_file {
-                                if packet_count >= 2 {
-                                    let to_write = match *remaining {
-                                        None => data.len(),
-                                        Some(r) if r > 0 => data.len().min(r),
-                                        _ => 0,
-                                    };
-                                    if to_write > 0 {
-                                        let _ = f.write_all(&data[..to_write]).await;
-                                        if let Some(ref mut r) = remaining {
-                                            *r = r.saturating_sub(to_write);
-                                            if *r == 0 {
-                                                log::info!("DownloadByTime: reached dump limit, closed dump file");
-                                                dump_file = None;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            if packet_count == 1 {
-                                const REPLAY_HEADER_LEN: usize = 32;
-                                if data.len() == REPLAY_HEADER_LEN {
-                                    log::info!("DownloadByTime: skipping 32-byte stream info");
-                                } else if data.len() >= 8 && data[4..8] == *b"ftyp" {
-                                    raw_replay_mode = true;
-                                    log::info!("DownloadByTime: stream starts with MP4 data");
-                                    let chunk = replay_raw_chunk(data);
-                                    if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
-                                        break 'recv_loop;
-                                    }
-                                } else {
-                                    pending_first_chunk = Some(data.to_vec());
-                                }
-                            } else {
-                                if packet_count == 2 && !raw_replay_mode {
-                                    if data.len() >= 8 && data[4..8] == *b"ftyp" {
-                                        raw_replay_mode = true;
-                                        log::info!("DownloadByTime: stream is MP4, forwarding raw bytes");
-                                    } else if data.len() > 512 {
-                                        raw_replay_mode = true;
-                                        log::info!("DownloadByTime: large non-BcMedia packet, forwarding raw data");
-                                    }
-                                }
-                                if raw_replay_mode {
-                                    if let Some(first_chunk) = pending_first_chunk.take() {
-                                        let chunk = replay_raw_chunk(&first_chunk);
-                                        if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
-                                            break 'recv_loop;
-                                        }
-                                    }
-                                    let chunk = replay_raw_chunk(data);
-                                    if packet_count <= 3 {
-                                        log::debug!(
-                                            "DownloadByTime raw chunk: pkt={} data_len={} payload_len={} data_first_64={:02x?} payload_first_64={:02x?}",
-                                            packet_count,
-                                            data.len(),
-                                            chunk.len(),
-                                            &data[..data.len().min(64)],
-                                            &chunk[..chunk.len().min(64)]
-                                        );
-                                    }
-                                    if tx.send(Ok(BcMedia::RawReplayChunk(chunk))).await.is_err() {
-                                        break 'recv_loop;
-                                    }
-                                } else {
-                                    if let Some(first_chunk) = pending_first_chunk.take() {
-                                        buf.extend_from_slice(&first_chunk);
-                                    }
-                                    buf.extend_from_slice(data);
-                                    while let Some(bc_media) = codec.decode(&mut buf)? {
-                                        if tx.send(Ok(bc_media)).await.is_err() {
-                                            break 'recv_loop;
-                                        }
-                                    }
-                                }
-                            }
+                        tokio::select! {
+                            _ = abort_handle_thread.cancelled() => {},
+                            _ = tx.send(Ok(BcMedia::StreamEnd)) => {},
+                        }
+                        break 'recv_loop;
+                    }
+                    if let BcBody::ModernMsg(ModernMsg {
+                        payload: Some(BcPayloads::Binary(ref data)), ..
+                    }) = msg.body {
+                        packets += 1;
+                        received_bytes += data.len();
+                        if let Some(ref mut file) = dump_file {
+                            let n = dump_remaining.map_or(data.len(), |r| data.len().min(r));
+                            file.write_all(&data[..n]).await?;
+                            if let Some(ref mut remaining) = dump_remaining {
+                                *remaining -= n;
                             }
                         }
+                        for frame in decoder.decode(data)? {
+                            if tokio::select! {
+                                _ = abort_handle_thread.cancelled() => true,
+                                sent = tx.send(Ok(frame)) => sent.is_err(),
+                            } {
+                                break 'recv_loop;
+                            }
+                        }
+                    } else if let BcBody::ModernMsg(ModernMsg {
+                        payload: Some(BcPayloads::BcXml(ref xml)), ..
+                    }) = msg.body {
+                        // The size acknowledgement describes the stored MP4,
+                        // not the number of bytes in the BcMedia transfer.
+                        log::debug!("DownloadByTime metadata: {:?}", xml.file_info_list);
                     }
                 }
+                if let Some(ref mut file) = dump_file {
+                    file.flush().await?;
+                }
+                Ok(())
+            }.await;
+            drop(sub);
+            // Always stop the accepted download, even after a decoder/I/O error.
+            let stop_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let mut stop = connection.subscribe(MSG_ID_DOWNLOAD_STOP, stop_msg_num).await?;
+                stop.send(Bc {
+                    meta: BcMeta {
+                        msg_id: MSG_ID_DOWNLOAD_STOP,
+                        channel_id,
+                        msg_num: stop_msg_num,
+                        stream_type: 0,
+                        response_code: 0,
+                        class: 0x6414,
+                    },
+                    body: BcBody::ModernMsg(ModernMsg { extension: None, payload: None }),
+                }).await?;
+                let reply = stop.recv().await?;
+                if reply.meta.response_code != 200 {
+                    return Err(Error::CameraServiceUnavailable {
+                        id: MSG_ID_DOWNLOAD_STOP, code: reply.meta.response_code,
+                    });
+                }
+                Ok::<(), Error>(())
+            }).await;
+            match stop_result {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => log::warn!("DownloadByTime: MSG 144 stop failed: {}", err),
+                Err(_) => log::warn!("DownloadByTime: MSG 144 stop timed out"),
             }
-            if let Some((ref mut f, _)) = dump_file {
-                let _ = f.flush().await;
-            }
-            let sub_stop = connection.subscribe(MSG_ID_DOWNLOAD_STOP, stop_msg_num).await?;
-            let stop_msg = Bc {
-                meta: BcMeta {
-                    msg_id: MSG_ID_DOWNLOAD_STOP,
-                    channel_id,
-                    msg_num: stop_msg_num,
-                    stream_type: 0,
-                    response_code: 0,
-                    class: 0x6414,
-                },
-                body: BcBody::ModernMsg(ModernMsg {
-                    extension: None,
-                    payload: None,
-                }),
-            };
-            let _ = sub_stop.send(stop_msg).await;
-            Ok(())
+            result
         });
-
         Ok(StreamData::from_parts(handle, rx, abort_handle))
     }
 
@@ -1578,7 +1407,59 @@ impl BcCamera {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_e1_replay_envelope;
+    use super::{download_by_time_xml, strip_e1_replay_envelope, ReplayDecoder};
+    use crate::bc::xml::{BcXml, ReplayDateTime};
+    use crate::bcmedia::model::BcMedia;
+
+    #[test]
+    fn download_xml_matches_captured_time_range() {
+        let start = ReplayDateTime {
+            year: 2026, month: 11, day: 12, hour: 15, minute: 38, second: 14,
+        };
+        let end = ReplayDateTime { second: 26, ..start.clone() };
+        let xml = download_by_time_xml(0, 1, start, end).unwrap();
+        let captured = BcXml::try_parse(include_bytes!("../bc/samples/replay_download_by_time.xml")).unwrap();
+        assert_eq!(xml, captured);
+        assert!(download_by_time_xml(0, 99,
+            ReplayDateTime { year: 2026, month: 11, day: 12, hour: 0, minute: 0, second: 0 },
+            ReplayDateTime { year: 2026, month: 11, day: 12, hour: 0, minute: 0, second: 1 },
+        ).is_err());
+    }
+
+    #[test]
+    fn replay_decodes_stream_info_and_large_split_iframe() {
+        // The first 32 bytes are InfoV2, not a disposable file-size header.
+        let info = [
+            0x31, 0x30, 0x30, 0x32, 0x20, 0, 0, 0, 0, 6, 0, 0, 0xb0, 1, 0, 0,
+            1, 15, 126, 11, 12, 15, 38, 14, 126, 11, 12, 15, 38, 26, 0, 0,
+        ];
+        let mut decoder = ReplayDecoder::new(true);
+        let decoded = decoder.decode(&info).unwrap();
+        assert!(matches!(&decoded[0], BcMedia::InfoV2(info) if info.fps == 15));
+        let mut iframe = b"00dcH264".to_vec();
+        iframe.extend_from_slice(&1024u32.to_le_bytes());
+        iframe.extend_from_slice(&4u32.to_le_bytes());
+        iframe.extend_from_slice(&100_000u32.to_le_bytes());
+        iframe.extend_from_slice(&0u32.to_le_bytes());
+        iframe.extend_from_slice(&1_794_498_694u32.to_le_bytes());
+        iframe.extend_from_slice(&vec![0x65; 1024]);
+        assert!(decoder.decode(&iframe[..600]).unwrap().is_empty());
+        let decoded = decoder.decode(&iframe[600..]).unwrap();
+        assert!(matches!(&decoded[0], BcMedia::Iframe(frame) if frame.data.len() == 1024));
+        assert!(decoder.buffer.is_empty());
+    }
+
+    #[test]
+    fn replay_passes_mp4_bytes_without_adding_nal_start_codes() {
+        let mut decoder = ReplayDecoder::new(true);
+        let header = b"\x00\x00\x00\x10ftypisom\x00\x00\x00\x00";
+        assert!(matches!(&decoder.decode(header).unwrap()[0],
+            BcMedia::RawReplayChunk(data) if data.as_slice() == header));
+        // 0x41 can be both a container byte and an H.264 NAL type.
+        let continuation = b"\x41container continuation";
+        assert!(matches!(&decoder.decode(continuation).unwrap()[0],
+            BcMedia::RawReplayChunk(data) if data.as_slice() == continuation));
+    }
 
     #[test]
     fn strip_e1_replay_envelope_returns_payload_after_xml() {

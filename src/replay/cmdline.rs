@@ -62,14 +62,14 @@ pub enum ReplayCommand {
         /// Stop after N seconds and close the file (camera keeps streaming otherwise). Use e.g. 10 for a 10s clip.
         #[arg(long)]
         duration: Option<u64>,
-        /// Debug: write raw replay stream (after 32-byte header) to this file. Use xxd or hex editor to inspect for ftyp/moov/mdat.
+        /// Debug: write decrypted BcMedia/container bytes, including stream info, to this file.
         #[arg(long)]
         dump_replay: Option<std::path::PathBuf>,
         /// Max bytes to write to --dump-replay (default 131072). Use 0 for full stream.
         #[arg(long)]
         dump_replay_limit: Option<usize>,
     },
-    /// Download a recording file (same as play; stops when camera sends response 300 or after --duration)
+    /// Download a recording via MSG 143 using its start/end times; replay fallback for older cameras
     Download {
         /// File name from "replay files" output
         #[arg(long)]
@@ -80,7 +80,7 @@ pub enum ReplayCommand {
         /// Output path for the downloaded file (e.g. .mp4)
         #[arg(long)]
         output: Option<std::path::PathBuf>,
-        /// Stop after N seconds if camera does not send response 300
+        /// Limit receiving to N wall-clock seconds (writes a partial recording)
         #[arg(long)]
         duration: Option<u64>,
         /// Debug: write raw replay stream to this file (default limit 128KB; use --dump-replay-limit 0 for full).
@@ -89,7 +89,7 @@ pub enum ReplayCommand {
         #[arg(long)]
         dump_replay_limit: Option<usize>,
     },
-    /// Download by time range (MSG 143; camera sends response 331 at end). Use when you want a date range instead of a file name.
+    /// Download by time range (MSG 143 XML; ends on response 300 or 331)
     DownloadByTime {
         /// Start date (YYYY-MM-DD); time 00:00:00
         #[arg(long)]
