@@ -18,6 +18,8 @@ use std::convert::TryInto;
 use std::path::Path;
 
 mod cmdline;
+mod container;
+mod output;
 
 #[cfg(feature = "gstreamer")]
 mod gst;
@@ -26,6 +28,7 @@ mod gst;
 const ANNEX_B_START: &[u8] = &[0x00, 0x00, 0x00, 0x01];
 
 /// Scan for the first BcMedia 4-byte LE magic (InfoV1/2, IFRAME, PFRAME, AAC). Returns offset or None.
+#[cfg(test)]
 fn find_bcmedia_magic_offset(stream: &[u8]) -> Option<usize> {
     const MAGIC_INFO_V1: u32 = 0x31303031;
     const MAGIC_INFO_V2: u32 = 0x32303031;
@@ -49,6 +52,7 @@ fn find_bcmedia_magic_offset(stream: &[u8]) -> Option<usize> {
 }
 
 /// True if payload looks like a valid H.264 or H.265 NAL. Drops garbage from resync false positives.
+#[cfg(test)]
 fn is_likely_valid_nal(payload: &[u8], video_type: VideoType) -> bool {
     if payload.is_empty() {
         return false;
@@ -69,6 +73,7 @@ fn is_likely_valid_nal(payload: &[u8], video_type: VideoType) -> bool {
 }
 
 /// Max bytes to advance on Incomplete without finding any NAL. Prevents hanging on garbage/ciphertext (e.g. undecrypted replay).
+#[cfg(test)]
 const BCMEDIA_RESYNC_CAP: usize = 128 * 1024;
 
 /// Decode a buffer (e.g. after stream_for_mp4_assembly) as BcMedia and collect video NAL payloads.
@@ -78,6 +83,7 @@ const BCMEDIA_RESYNC_CAP: usize = 128 * 1024;
 /// Only payloads that look like valid H.264/H.265 NALs are collected to avoid garbage from resync.
 /// See notes/REPLAY_VIDEO_FORMAT.md.
 /// Result of decoding a BcMedia stream.
+#[cfg(test)]
 struct BcMediaDecoded {
     nals: Vec<Vec<u8>>,
     video_type: VideoType,
@@ -88,6 +94,7 @@ struct BcMediaDecoded {
     aac_data: Vec<u8>,
 }
 
+#[cfg(test)]
 fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
     let mut codec = BcMediaCodex::new(false);
     let mut buf = BytesMut::from(stream);
@@ -100,7 +107,12 @@ fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
     let mut bytes_advanced_without_nal: usize = 0;
     loop {
         match codec.decode(&mut buf) {
-            Ok(Some(BcMedia::Iframe(BcMediaIframe { data, microseconds, video_type: frame_type, .. }))) => {
+            Ok(Some(BcMedia::Iframe(BcMediaIframe {
+                data,
+                microseconds,
+                video_type: frame_type,
+                ..
+            }))) => {
                 if is_likely_valid_nal(&data, frame_type) {
                     nals.push(data);
                     timestamps_us.push(microseconds);
@@ -108,7 +120,12 @@ fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
                     bytes_advanced_without_nal = 0;
                 }
             }
-            Ok(Some(BcMedia::Pframe(BcMediaPframe { data, microseconds, video_type: frame_type, .. }))) => {
+            Ok(Some(BcMedia::Pframe(BcMediaPframe {
+                data,
+                microseconds,
+                video_type: frame_type,
+                ..
+            }))) => {
                 if is_likely_valid_nal(&data, frame_type) {
                     nals.push(data);
                     timestamps_us.push(microseconds);
@@ -145,7 +162,10 @@ fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
         }
     }
     if !aac_data.is_empty() {
-        log::info!("Replay: collected {} bytes of AAC audio from BcMedia stream", aac_data.len());
+        log::info!(
+            "Replay: collected {} bytes of AAC audio from BcMedia stream",
+            aac_data.len()
+        );
     }
     if nals.is_empty() {
         None
@@ -161,6 +181,7 @@ fn try_decode_bcmedia_nals(stream: &[u8]) -> Option<BcMediaDecoded> {
 }
 
 /// Compute actual average fps from per-frame microsecond timestamps. Returns None if < 2 frames.
+#[cfg(test)]
 fn compute_actual_fps(timestamps_us: &[u32]) -> Option<f64> {
     if timestamps_us.len() < 2 {
         return None;
@@ -203,154 +224,6 @@ struct RecordingMeta {
     pub camera_name: Option<String>,
 }
 
-/// Mux decoded BcMedia NALs + optional AAC audio to MP4.
-/// Uses GStreamer (with per-frame PTS from timestamps) when available; falls back to ffmpeg.
-/// If `meta` is provided, AI detection tags and timing info are embedded in the MP4.
-/// Returns Ok(true) on success.
-async fn mux_to_mp4(
-    nals: &[Vec<u8>],
-    video_type: VideoType,
-    aac_data: &[u8],
-    fps: u8,
-    timestamps_us: &[u32],
-    output: &Path,
-    meta: &RecordingMeta,
-) -> Result<bool> {
-    if let Some(afps) = compute_actual_fps(timestamps_us) {
-        log::info!(
-            "Replay: actual avg fps from timestamps = {:.2} (declared fps = {})",
-            afps, fps
-        );
-    }
-
-    // Primary: GStreamer with per-frame PTS (handles VFR + audio natively, no external binaries)
-    #[cfg(feature = "gstreamer")]
-    {
-        let nals = nals.to_vec();
-        let video_type = video_type;
-        let timestamps_us = timestamps_us.to_vec();
-        let aac_data = aac_data.to_vec();
-        let path = output.to_path_buf();
-        let gst_meta = gst::Mp4Metadata {
-            record_type: meta.record_type.clone(),
-            start_time: meta.start_time.clone(),
-            end_time: meta.end_time.clone(),
-            camera_name: meta.camera_name.clone(),
-        };
-        match tokio::task::spawn_blocking(move || {
-            gst::mux_nals_to_mp4(
-                &nals,
-                video_type,
-                &timestamps_us,
-                &aac_data,
-                &path,
-                &gst_meta,
-            )
-        })
-        .await
-        {
-            Ok(Ok(())) => return Ok(true),
-            Ok(Err(e)) => log::warn!("Replay: GStreamer mux failed: {:?}, trying ffmpeg", e),
-            Err(e) => log::warn!("Replay: GStreamer task panicked: {:?}, trying ffmpeg", e),
-        }
-    }
-
-    // Fallback: ffmpeg with computed average fps
-    let effective_fps = compute_actual_fps(timestamps_us).unwrap_or(fps as f64);
-    let fps_str = format!("{:.3}", effective_fps);
-    log::info!("Replay: muxing with ffmpeg at {} fps (fallback)", fps_str);
-
-    let (temp_extension, input_format) = match video_type {
-        VideoType::H264 => ("replay.h264", "h264"),
-        VideoType::H265 => ("replay.h265", "hevc"),
-    };
-    let video_path = output.with_extension(temp_extension);
-    let annex_b = annex_b_from_nals(nals);
-    tokio::fs::write(&video_path, &annex_b)
-        .await
-        .context("Write temporary Annex B video")?;
-
-    let aac_path = output.with_extension("replay.aac");
-    if !aac_data.is_empty() {
-        tokio::fs::write(&aac_path, aac_data).await.context("Write temp AAC")?;
-    }
-
-    let mut cmd = tokio::process::Command::new("ffmpeg");
-    cmd.args([
-        "-y", "-hide_banner", "-loglevel", "error", "-fflags", "+genpts", "-r",
-        &fps_str, "-f", input_format, "-i",
-    ]);
-    cmd.arg(&video_path);
-    if !aac_data.is_empty() {
-        cmd.args(["-f", "aac", "-i"]);
-        cmd.arg(&aac_path);
-    }
-    cmd.args(["-c", "copy", "-fps_mode", "cfr", "-r", &fps_str, "-movflags", "+faststart"]);
-    // Embed metadata
-    if let Some(ref rt) = meta.record_type {
-        cmd.args(["-metadata", &format!("comment=recordType: {}", rt)]);
-    }
-    if let Some(ref desc) = meta.start_time {
-        cmd.args(["-metadata", &format!("description=Start: {}", desc)]);
-    }
-    cmd.arg(output);
-
-    let status = cmd.status().await.context("Run ffmpeg for BcMedia mux")?;
-    let _ = tokio::fs::remove_file(&video_path).await;
-    if !aac_data.is_empty() {
-        let _ = tokio::fs::remove_file(&aac_path).await;
-    }
-    Ok(status.success())
-}
-
-/// Save downloaded video as MP4 when a muxer is available, otherwise retain an
-/// elementary Annex B stream with an extension that matches its codec.
-async fn write_video_output(
-    nals: &[Vec<u8>],
-    video_type: VideoType,
-    aac_data: &[u8],
-    fps: u8,
-    timestamps_us: &[u32],
-    output: &Path,
-    meta: &RecordingMeta,
-) -> Result<()> {
-    let is_mp4 = output
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("mp4"))
-        .unwrap_or(false);
-    if is_mp4 {
-        match mux_to_mp4(nals, video_type, aac_data, fps, timestamps_us, output, meta).await {
-            Ok(true) => {
-                println!("Wrote downloaded video as MP4 to {}", output.display());
-                return Ok(());
-            }
-            Ok(false) => log::warn!("Replay: MP4 mux failed; keeping the elementary video stream"),
-            Err(e) => log::warn!("Replay: MP4 mux unavailable: {:?}; keeping the elementary video stream", e),
-        }
-    }
-
-    let fallback_output = if is_mp4 {
-        let extension = match video_type {
-            VideoType::H264 => "h264",
-            VideoType::H265 => "h265",
-        };
-        output.with_extension(extension)
-    } else {
-        output.to_path_buf()
-    };
-    let annex_b = annex_b_from_nals(nals);
-    tokio::fs::write(&fallback_output, &annex_b)
-        .await
-        .context("Write Annex B video")?;
-    println!(
-        "Wrote {} bytes of Annex B video to {}",
-        annex_b.len(),
-        fallback_output.display()
-    );
-    Ok(())
-}
-
 /// Format a ReplayDateTime as "YYYY-MM-DD HH:MM:SS".
 fn format_replay_datetime(dt: &ReplayDateTime) -> String {
     format!(
@@ -360,6 +233,7 @@ fn format_replay_datetime(dt: &ReplayDateTime) -> String {
 }
 
 /// Write H.264/H.265 NAL payloads as Annex B. Existing start codes are preserved.
+#[cfg(test)]
 fn annex_b_from_nals(nals: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for nal in nals {
@@ -391,14 +265,20 @@ fn find_annexb_h264_start(buffer: &[u8]) -> Option<usize> {
 }
 
 use crate::common::NeoReactor;
+#[cfg(test)]
 use bytes::{Buf, BytesMut};
 use neolink_core::bc::xml::{DayRecords, FileInfo, ReplayDateTime};
+#[cfg(test)]
 use neolink_core::bcmedia::codex::BcMediaCodex;
-use neolink_core::bcmedia::model::{
-    BcMedia, BcMediaAac, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
-};
+use neolink_core::bcmedia::model::{BcMedia, VideoType};
 use tokio::time::{sleep_until, Duration, Instant};
+#[cfg(test)]
 use tokio_util::codec::Decoder;
+
+#[cfg(test)]
+use neolink_core::bcmedia::model::{
+    BcMediaAac, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe,
+};
 
 pub(crate) use cmdline::Opt;
 
@@ -424,13 +304,21 @@ fn patch_e1_avcc_if_needed(path: &Path) -> Result<()> {
         if content_start + CONTENT_LENGTH_SIZE_BYTE < head.len() {
             let b4 = head[content_start + CONTENT_LENGTH_SIZE_BYTE];
             if b4 != LENGTH_SIZE_BYTE_CORRECT {
-                patches.push((content_start + CONTENT_LENGTH_SIZE_BYTE, b4, LENGTH_SIZE_BYTE_CORRECT));
+                patches.push((
+                    content_start + CONTENT_LENGTH_SIZE_BYTE,
+                    b4,
+                    LENGTH_SIZE_BYTE_CORRECT,
+                ));
             }
         }
         if content_start + CONTENT_CONFIG_VERSION < head.len() {
             let b0 = head[content_start + CONTENT_CONFIG_VERSION];
             if b0 != CONFIG_VERSION_CORRECT {
-                patches.push((content_start + CONTENT_CONFIG_VERSION, b0, CONFIG_VERSION_CORRECT));
+                patches.push((
+                    content_start + CONTENT_CONFIG_VERSION,
+                    b0,
+                    CONFIG_VERSION_CORRECT,
+                ));
             }
         }
         if !patches.is_empty() {
@@ -443,7 +331,11 @@ fn patch_e1_avcc_if_needed(path: &Path) -> Result<()> {
             }
             f.sync_all().context("Sync patched MP4 to disk")?;
             for (_, w, c) in &patches {
-                log::info!("Replay: patched E1 avcC (0x{:02x} -> 0x{:02x}) for playback", w, c);
+                log::info!(
+                    "Replay: patched E1 avcC (0x{:02x} -> 0x{:02x}) for playback",
+                    w,
+                    c
+                );
             }
         }
     }
@@ -504,26 +396,50 @@ fn patch_avc1_colour_if_needed(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Parse box size at buffer[start]; supports 32-bit and size=1 (64-bit).
-fn parse_box_size(buffer: &[u8], start: usize) -> Result<usize> {
-    if buffer.len() < start + 8 {
-        anyhow::bail!("Buffer too short for box header at {}", start);
-    }
-    let size_u32 = u32::from_be_bytes(buffer[start..start + 4].try_into().unwrap());
-    if size_u32 == 1 {
-        if buffer.len() < start + 16 {
-            anyhow::bail!("Buffer too short for 64-bit box size");
-        }
-        let size64 = u64::from_be_bytes(buffer[start + 8..start + 16].try_into().unwrap());
-        Ok(size64 as usize)
-    } else {
-        Ok(size_u32 as usize)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn playback_keeps_metadata_timer_but_downloads_are_not_limited_by_media_duration() {
+        let start = ReplayDateTime {
+            year: 2026,
+            month: 11,
+            day: 12,
+            hour: 15,
+            minute: 4,
+            second: 47,
+        };
+        let metadata = FileInfo {
+            start_time: Some(start.clone()),
+            end_time: Some(ReplayDateTime {
+                second: 54,
+                ..start
+            }),
+            ..Default::default()
+        };
+        assert_eq!(replay_duration(None, false, Some(&metadata)), Some(7));
+        assert_eq!(replay_duration(None, true, Some(&metadata)), None);
+        assert_eq!(replay_duration(Some(5), true, Some(&metadata)), Some(5));
+        assert_eq!(replay_duration(None, false, None), None);
+    }
+
+    #[test]
+    fn download_retry_preserves_receive_fallback_and_does_not_retry_output_or_auth_errors() {
+        assert!(retry_download_error(
+            &neolink_core::Error::TimeoutDisconnected.into()
+        ));
+        assert!(retry_download_error(
+            &neolink_core::Error::CameraServiceUnavailable { id: 143, code: 405 }.into()
+        ));
+        assert!(!retry_download_error(
+            &neolink_core::Error::CameraServiceUnavailable { id: 143, code: 401 }.into()
+        ));
+        assert!(!retry_download_error(
+            &std::io::Error::new(std::io::ErrorKind::PermissionDenied, "output is read-only")
+                .into()
+        ));
+    }
 
     /// Minimal BcMedia IFRAME: magic 0x63643030, "H264", payload_size=5, additional_header_size=0,
     /// then 5-byte NAL (start code + SPS type) + 3-byte pad to 8-byte boundary.
@@ -531,7 +447,7 @@ mod tests {
         let mut buf = Vec::new();
         buf.extend_from_slice(&0x63643030u32.to_le_bytes()); // MAGIC IFRAME
         buf.extend_from_slice(b"H264");
-        buf.extend_from_slice(&5u32.to_le_bytes());  // payload_size
+        buf.extend_from_slice(&5u32.to_le_bytes()); // payload_size
         buf.extend_from_slice(&0u32.to_le_bytes()); // additional_header_size
         buf.extend_from_slice(&1000u32.to_le_bytes()); // microseconds = 1ms
         buf.extend_from_slice(&0u32.to_le_bytes()); // unknown_b
@@ -544,13 +460,20 @@ mod tests {
     fn test_try_decode_bcmedia_nals_decodes_iframe() {
         let stream = minimal_bcmedia_iframe();
         let result = try_decode_bcmedia_nals(&stream);
-        assert!(result.is_some(), "BcMedia decode should return Some(BcMediaDecoded)");
+        assert!(
+            result.is_some(),
+            "BcMedia decode should return Some(BcMediaDecoded)"
+        );
         let decoded = result.unwrap();
         assert_eq!(decoded.nals.len(), 1);
+        assert!(matches!(decoded.video_type, VideoType::H264));
         assert_eq!(decoded.nals[0], &[0x00, 0x00, 0x00, 0x01, 0x67]);
         assert_eq!(decoded.timestamps_us.len(), 1);
         assert_eq!(decoded.timestamps_us[0], 1000);
-        assert_eq!(decoded.fps, 25, "Default fps should be 25 when no InfoV1/V2 header");
+        assert_eq!(
+            decoded.fps, 25,
+            "Default fps should be 25 when no InfoV1/V2 header"
+        );
         assert!(decoded.aac_data.is_empty(), "No audio in video-only stream");
     }
 
@@ -603,8 +526,16 @@ mod tests {
             .map(|off| &raw[off..])
             .unwrap_or_else(|| stream_for_mp4_assembly(&raw, None));
         let decoded = try_decode_bcmedia_nals(stream).expect("BcMedia decode");
-        assert!(!decoded.nals.is_empty(), "should get at least one video frame");
-        eprintln!("Replay dump: {} NALs, fps={}, aac={} bytes", decoded.nals.len(), decoded.fps, decoded.aac_data.len());
+        assert!(
+            !decoded.nals.is_empty(),
+            "should get at least one video frame"
+        );
+        eprintln!(
+            "Replay dump: {} NALs, fps={}, aac={} bytes",
+            decoded.nals.len(),
+            decoded.fps,
+            decoded.aac_data.len()
+        );
         let annex_b = annex_b_from_nals(&decoded.nals);
         assert!(annex_b.len() > 4, "Annex B output non-empty");
     }
@@ -613,6 +544,7 @@ mod tests {
 /// Replay stream used for MP4 assembly. If the buffer doesn't start with ftyp, we may skip
 /// the first 32-byte replay header (app does this only for MSG 5; for 0x17d it writes the 32 bytes).
 /// `skip_first_32`: Some(true) = skip 32 when no ftyp (MSG 5); Some(false) = never skip (MSG 8/0x17d); None = legacy (skip when no ftyp and len>32).
+#[cfg(test)]
 fn stream_for_mp4_assembly(buffer: &[u8], skip_first_32: Option<bool>) -> &[u8] {
     const REPLAY_HEADER_LEN: usize = 32;
     let starts_with_ftyp = buffer.len() >= 8 && buffer[4..8] == *b"ftyp";
@@ -626,265 +558,6 @@ fn stream_for_mp4_assembly(buffer: &[u8], skip_first_32: Option<bool>) -> &[u8] 
     } else {
         buffer
     }
-}
-
-/// ftyp box and return the slice from that box to the end. Accepts ftyp size 8..=1024 (ISO BMFF allows variable length).
-/// Returns None if buffer already starts with ftyp or no valid ftyp found.
-fn slice_from_ftyp(buffer: &[u8]) -> Option<&[u8]> {
-    const FTYP_SIZE_MAX: u32 = 1024;
-    if buffer.len() >= 8 && buffer[4..8] == *b"ftyp" {
-        return None; // already starts with ftyp, caller uses buffer as-is
-    }
-    // Search for [size_be][b"ftyp"] so we can start MP4 from there
-    let mut i = 0;
-    let mut first_ftyp_at: Option<(usize, u32)> = None; // for diagnostic if no valid box found
-    while i + 8 <= buffer.len() {
-        if buffer[i + 4..i + 8] == *b"ftyp" {
-            let size = u32::from_be_bytes(buffer[i..i + 4].try_into().unwrap());
-            if first_ftyp_at.is_none() {
-                first_ftyp_at = Some((i, size));
-            }
-            let sz = size as usize;
-            if size >= 8 && size <= FTYP_SIZE_MAX && buffer.len() >= i + sz + 8 {
-                return Some(&buffer[i..]);
-            }
-        }
-        i += 1;
-    }
-    if let Some((off, size)) = first_ftyp_at {
-        log::info!(
-            "Replay: found \"ftyp\" at offset {} but size {} not in 8..{} or buffer too short; cannot use as MP4 start",
-            off, size, FTYP_SIZE_MAX
-        );
-    } else if !buffer.is_empty() {
-        log::debug!(
-            "Replay: no ftyp in buffer (first 32 bytes): {:02x?}",
-            &buffer[..buffer.len().min(32)]
-        );
-    }
-    None
-}
-
-/// Given start of mdat box, return (content_start, header_len in bytes).
-fn parse_mdat_header_range(buffer: &[u8], mdat_start: usize) -> Result<(usize, usize)> {
-    if buffer.len() < mdat_start + 8 {
-        anyhow::bail!("Buffer too short for mdat header");
-    }
-    let size_u32 = u32::from_be_bytes(buffer[mdat_start..mdat_start + 4].try_into().unwrap());
-    if size_u32 == 1 {
-        if buffer.len() < mdat_start + 16 {
-            anyhow::bail!("Buffer too short for mdat 64-bit size");
-        }
-        Ok((mdat_start + 16, 16))
-    } else {
-        Ok((mdat_start + 8, 8))
-    }
-}
-
-/// Build a playable MP4 by wrapping post-moov payload in an mdat box and fixing stco/co64.
-/// Buffer is the raw stream after the 32-byte replay header (starts with ftyp).
-/// Handles both box orders: ftyp+moov+mdat and ftyp+mdat+moov (E1 and others).
-/// Provenance: reassembly requires updating stco/co64 when we relocate mdat (ISO BMFF).
-/// E1 moov may lack stco/co64 (camera uses different structure); then we have a gap (see notes § Replay: full end-to-end flow and provenance).
-fn assemble_mp4_with_mdat(buffer: &[u8]) -> Result<Vec<u8>> {
-    if buffer.len() < 8 {
-        anyhow::bail!("Replay buffer too short for ftyp");
-    }
-    if buffer[4..8] != *b"ftyp" {
-        anyhow::bail!("Replay buffer does not start with ftyp");
-    }
-    let ftyp_size = u32::from_be_bytes(buffer[0..4].try_into().unwrap()) as usize;
-    const FTYP_SIZE_MAX: usize = 1024;
-    if ftyp_size < 8 || ftyp_size > FTYP_SIZE_MAX || buffer.len() < ftyp_size + 8 {
-        anyhow::bail!(
-            "Replay buffer: invalid ftyp box size {} (max {}) or buffer too short",
-            ftyp_size, FTYP_SIZE_MAX
-        );
-    }
-
-    let (moov_start, moov_end, payload, mdat_payload_offset) = {
-        let first_box_type = &buffer[ftyp_size + 4..ftyp_size + 8];
-        if first_box_type == b"moov" {
-            // Layout: ftyp + moov + [mdat or raw payload]
-            let moov_start = ftyp_size;
-            let moov_size = parse_box_size(buffer, moov_start)?;
-            let moov_end = moov_start + moov_size;
-            if buffer.len() < moov_end {
-                anyhow::bail!("Replay buffer truncated before end of moov (moov_size={})", moov_size);
-            }
-            let (payload, mdat_header_in_output) = if buffer.len() >= moov_end + 8 && buffer[moov_end + 4..moov_end + 8] == *b"mdat" {
-                let (mdat_content_start, _) = parse_mdat_header_range(buffer, moov_end)?;
-                (&buffer[mdat_content_start..], 8usize)
-            } else {
-                (&buffer[moov_end..], 8usize)
-            };
-            let mdat_payload_offset = moov_end + mdat_header_in_output;
-            (moov_start, moov_end, payload, mdat_payload_offset)
-        } else if first_box_type == b"mdat" {
-            // Layout: ftyp + mdat + [optional boxes] + moov (E1 and some cameras)
-            let mdat_start = ftyp_size;
-            let mdat_box_len = parse_box_size(buffer, mdat_start)?;
-            let mdat_end = mdat_start + mdat_box_len;
-            if buffer.len() < mdat_end + 8 {
-                anyhow::bail!("Replay buffer truncated before moov (mdat_size={})", mdat_box_len);
-            }
-            // Skip any boxes (free, wide, etc.) until we find moov
-            let mut pos = mdat_end;
-            let (moov_start, moov_size) = loop {
-                if pos + 8 > buffer.len() {
-                    anyhow::bail!("Replay buffer: no moov box found after mdat");
-                }
-                let box_size = parse_box_size(buffer, pos)?;
-                let box_type = &buffer[pos + 4..pos + 8];
-                if box_type == b"moov" {
-                    break (pos, box_size);
-                }
-                pos += box_size;
-            };
-            let moov_end = moov_start + moov_size;
-            if buffer.len() < moov_end {
-                anyhow::bail!("Replay buffer truncated before end of moov (moov_size={})", moov_size);
-            }
-            // Output will be ftyp + moov + mdat; mdat content starts at ftyp + moov_size + 8
-            let payload = if buffer[mdat_start + 4..mdat_start + 8] == *b"mdat" {
-                let (content_start, _) = parse_mdat_header_range(buffer, mdat_start)?;
-                &buffer[content_start..mdat_end]
-            } else {
-                &buffer[mdat_start + 8..mdat_end]
-            };
-            let mdat_payload_offset = ftyp_size + moov_size + 8;
-            (moov_start, moov_end, payload, mdat_payload_offset)
-        } else {
-            anyhow::bail!("Replay buffer: expected moov or mdat after ftyp, got {:?}", first_box_type);
-        }
-    };
-
-    let mut moov_copy = buffer[moov_start..moov_end].to_vec();
-    let mut patched_count = 0u32;
-
-    // Helper: for a chunk-offset box at tag_offset i (start of "stco" or "co64"), return (box_start, header_len to first entry, entry_count, entry_byte_len).
-    let chunk_box_meta = |moov: &[u8], i: usize, entry_byte_len: usize| -> Option<(usize, usize, usize, usize)> {
-        if i < 4 {
-            return None;
-        }
-        let box_start = i - 4;
-        let size_u32 = u32::from_be_bytes(moov[box_start..box_start + 4].try_into().unwrap());
-        let (header_len, count_offset) = if size_u32 == 1 {
-            // Extended size: size(4)=1, type(4), size64(8), ver+flags(4), entry_count(4)
-            if i + 20 > moov.len() {
-                return None;
-            }
-            (20, 16)
-        } else {
-            (12, 8)
-        };
-        let first_entry = i + header_len;
-        let count_end = i + count_offset + 4;
-        if count_end > moov.len() || first_entry + entry_byte_len > moov.len() {
-            return None;
-        }
-        let entry_count = u32::from_be_bytes(moov[i + count_offset..count_end].try_into().unwrap()) as usize;
-        let box_size = if size_u32 == 1 {
-            if box_start + 16 > moov.len() {
-                return None;
-            }
-            u64::from_be_bytes(moov[box_start + 8..box_start + 16].try_into().unwrap()) as usize
-        } else {
-            size_u32 as usize
-        };
-        if box_start + box_size > moov.len() {
-            return None;
-        }
-        Some((box_start, first_entry, entry_count, box_size))
-    };
-
-    // Patch all stco boxes (32-bit chunk offsets).
-    let mut search_from = 0usize;
-    while let Some(i) = moov_copy[search_from..].windows(4).position(|w| w == b"stco") {
-        let i = search_from + i;
-        if let Some((box_start, first_entry, entry_count, box_size)) = chunk_box_meta(&moov_copy, i, 4) {
-            let old_first = u32::from_be_bytes(moov_copy[first_entry..first_entry + 4].try_into().unwrap());
-            let delta = (mdat_payload_offset as i64) - (old_first as i64);
-            for j in 0..entry_count {
-                let pos = first_entry + j * 4;
-                if pos + 4 > moov_copy.len() {
-                    break;
-                }
-                let old_val = u32::from_be_bytes(moov_copy[pos..pos + 4].try_into().unwrap());
-                let new_val = ((old_val as i64) + delta) as u32;
-                moov_copy[pos..pos + 4].copy_from_slice(&new_val.to_be_bytes());
-            }
-            patched_count += 1;
-            search_from = box_start + box_size;
-        } else {
-            search_from = i + 1;
-        }
-    }
-
-    // Patch all co64 boxes (64-bit chunk offsets).
-    search_from = 0usize;
-    while let Some(i) = moov_copy[search_from..].windows(4).position(|w| w == b"co64") {
-        let i = search_from + i;
-        if let Some((box_start, first_entry, entry_count, box_size)) = chunk_box_meta(&moov_copy, i, 8) {
-            let old_first = u64::from_be_bytes(moov_copy[first_entry..first_entry + 8].try_into().unwrap());
-            let delta = (mdat_payload_offset as i64) - (old_first as i64);
-            for j in 0..entry_count {
-                let pos = first_entry + j * 8;
-                if pos + 8 > moov_copy.len() {
-                    break;
-                }
-                let old_val = u64::from_be_bytes(moov_copy[pos..pos + 8].try_into().unwrap());
-                let new_val = ((old_val as i64) + delta) as u64;
-                moov_copy[pos..pos + 8].copy_from_slice(&new_val.to_be_bytes());
-            }
-            patched_count += 1;
-            search_from = box_start + box_size;
-        } else {
-            search_from = i + 1;
-        }
-    }
-
-    if patched_count == 0 {
-        log::warn!("Replay: no stco/co64 found in moov, mdat offset may be wrong");
-        // Diagnose: do the strings exist but chunk_box_meta failed?
-        let moov_len = moov_copy.len();
-        if let Some(pos) = moov_copy.windows(4).position(|w| w == b"stco") {
-            let box_start = pos.saturating_sub(4);
-            let size_u32 = if box_start + 4 <= moov_len {
-                u32::from_be_bytes(moov_copy[box_start..box_start + 4].try_into().unwrap())
-            } else {
-                0
-            };
-            log::info!("Replay: moov size {} bytes; 'stco' at offset {} (box size field={}), chunk_box_meta would need valid box", moov_len, pos, size_u32);
-        } else if let Some(pos) = moov_copy.windows(4).position(|w| w == b"co64") {
-            let box_start = pos.saturating_sub(4);
-            let size_u32 = if box_start + 4 <= moov_len {
-                u32::from_be_bytes(moov_copy[box_start..box_start + 4].try_into().unwrap())
-            } else {
-                0
-            };
-            log::info!("Replay: moov size {} bytes; 'co64' at offset {} (box size field={}), chunk_box_meta would need valid box", moov_len, pos, size_u32);
-        } else {
-            log::info!("Replay: moov size {} bytes; no 'stco' or 'co64' substring in moov (camera may use different structure)", moov_len);
-        }
-    } else {
-        log::info!("Replay: patched {} stco/co64 box(es) to mdat offset {}", patched_count, mdat_payload_offset);
-    }
-
-    let mdat_box_len = 8 + payload.len(); // 4 size + 4 tag + payload
-    let mut out = Vec::with_capacity(ftyp_size + moov_copy.len() + mdat_box_len);
-    out.extend_from_slice(&buffer[0..ftyp_size]);
-    out.extend_from_slice(&moov_copy);
-    if mdat_box_len <= 0xFF_FF_FF_FF {
-        out.extend_from_slice(&(mdat_box_len as u32).to_be_bytes());
-        out.extend_from_slice(b"mdat");
-    } else {
-        out.extend_from_slice(&1u32.to_be_bytes()); // size 1 = 64-bit size follows
-        out.extend_from_slice(b"mdat");
-        out.extend_from_slice(&((16 + payload.len()) as u64).to_be_bytes()); // 4+4+8+payload
-    }
-    out.extend_from_slice(payload);
-    Ok(out)
 }
 
 /// Parse YYYY-MM-DD into (year, month, day).
@@ -924,6 +597,121 @@ fn date_to_replay_end(year: i32, month: u8, day: u8) -> ReplayDateTime {
     }
 }
 
+/// Common receive loop for all transports. Receive errors are returned only after cleanup.
+async fn receive_recording(
+    stream: &mut neolink_core::bc_protocol::StreamData,
+    writer: &mut output::RecordingWriter,
+    duration: Option<u64>,
+) -> Result<bool> {
+    let deadline = duration.map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    loop {
+        let frame = tokio::select! {
+            _ = async { match deadline { Some(deadline) => sleep_until(deadline).await, None => std::future::pending().await } } => {
+                log::info!("Replay: explicit duration limit reached; retaining partial recording");
+                return Ok(false);
+            },
+            _ = tokio::signal::ctrl_c() => {
+                return Ok(false);
+            },
+            result = stream.get_data() => result??,
+        };
+        if matches!(frame, BcMedia::StreamEnd) {
+            return Ok(true);
+        }
+        writer.push(frame).context("Write recording spool")?;
+    }
+}
+
+async fn stop_recording(
+    camera: &crate::common::NeoInstance,
+    stream: &mut neolink_core::bc_protocol::StreamData,
+    replay_name: Option<&str>,
+) -> Result<()> {
+    // Cancel and join the producer first; its ID 144 cleanup must finish before any retry.
+    let result = stream.shutdown().await.context("Stop recording receiver");
+    if let Some(name) = replay_name {
+        let stop = tokio::time::timeout(
+            Duration::from_secs(5),
+            camera.run_task(|cam| {
+                let name = name.to_string();
+                Box::pin(async move { cam.replay_stop(&name).await.context("Replay stop failed") })
+            }),
+        )
+        .await;
+        if !matches!(stop, Ok(Ok(()))) {
+            log::warn!("Replay: MSG 7 stop failed or timed out: {:?}", stop);
+        }
+    }
+    result
+}
+
+async fn save_recording(
+    writer: &mut output::RecordingWriter,
+    output: Option<&Path>,
+    metadata: &RecordingMeta,
+    partial: bool,
+) -> Result<()> {
+    if !writer.has_video() {
+        return Ok(());
+    }
+    if let Some(output) = output {
+        match writer.finish(output, metadata, partial).await {
+            Ok(path) => println!(
+                "Wrote {}recording to {}",
+                if partial { "partial " } else { "" },
+                path.display()
+            ),
+            Err(err) => {
+                // Keep the spool on disk if finalization fails; callers report its location.
+                return Err(err).context("Could not finalize recording; spool retained");
+            }
+        }
+    } else {
+        log::info!(
+            "Replay: received {} video frames, {} raw bytes",
+            writer.frames,
+            writer.raw_bytes
+        );
+    }
+    Ok(())
+}
+
+fn retry_download_error(error: &anyhow::Error) -> bool {
+    match error.downcast_ref::<neolink_core::Error>() {
+        Some(neolink_core::Error::CameraServiceUnavailable {
+            code: 401 | 403, ..
+        }) => false,
+        Some(neolink_core::Error::Other(
+            "Replay interrupted by user" | "Explicit replay duration limit reached",
+        )) => false,
+        Some(_) => true,
+        None => false, // Output I/O failures must not start another camera download.
+    }
+}
+
+/// Playback retains the legacy metadata timer. A download uses transport completion instead.
+fn replay_duration(
+    explicit: Option<u64>,
+    is_download: bool,
+    metadata: Option<&FileInfo>,
+) -> Option<u64> {
+    if explicit.is_some() || is_download {
+        return explicit;
+    }
+    let metadata = metadata?;
+    let convert = |date: &ReplayDateTime| {
+        Some(time::PrimitiveDateTime::new(
+            time::Date::from_calendar_date(date.year, date.month.try_into().ok()?, date.day)
+                .ok()?,
+            time::Time::from_hms(date.hour, date.minute, date.second).ok()?,
+        ))
+    };
+    let start = convert(metadata.start_time.as_ref()?)?;
+    let end = convert(metadata.end_time.as_ref()?)?;
+    let seconds = (end - start).whole_seconds();
+    (seconds > 0).then_some(seconds as u64)
+}
+
 async fn run_replay_or_download(
     camera: &crate::common::NeoInstance,
     name: &str,
@@ -935,305 +723,177 @@ async fn run_replay_or_download(
     dump_replay_limit: Option<usize>,
     is_download: bool,
 ) -> Result<()> {
-    log::info!(
-        "Replay {}: name={} stream={} speed={}",
-        if is_download { "download" } else { "play" },
-        name,
-        stream_type,
-        speed
-    );
-    // --duration is an explicit wall-clock limit. Recording duration describes
-    // media time and must not stop a download while data is still in flight.
-    // Get file metadata (size, record_type with AI tags, timing) from file list.
-    let file_meta: Option<FileInfo> = camera
-        .run_task(|cam| {
+    // Metadata is optional and bounded. ID 13 is queried by start_replay after seek (123).
+    let file_meta = tokio::time::timeout(
+        Duration::from_secs(20),
+        camera.run_task(|cam| {
             let name = name.to_string();
             let stream_type = stream_type.to_string();
-            let record_type = cmdline::FILE_SEARCH_RECORD_TYPES.to_string();
             Box::pin(async move {
-                let meta = match cam.get_replay_file_metadata(&name, &stream_type, &record_type).await {
-                    Ok(Some(info)) => Some(info),
-                    _ => cam.get_file_by_name(&name, 0, speed, &stream_type).await.ok(),
-                };
-                Ok(meta)
+                Ok(cam
+                    .get_replay_file_metadata(
+                        &name,
+                        &stream_type,
+                        cmdline::FILE_SEARCH_RECORD_TYPES,
+                    )
+                    .await
+                    .ok()
+                    .flatten())
             })
-        })
-        .await
-        .ok()
-        .flatten();
+        }),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .flatten();
+    let duration = replay_duration(duration, is_download, file_meta.as_ref());
     let expected_size = file_meta.as_ref().and_then(|info| {
-        let l = info.size_l.unwrap_or(0) as u64;
-        let h = info.size_h.unwrap_or(0) as u64;
-        if l == 0 && h == 0 { None } else { Some(l + (h << 32)) }
+        let size = info.size_l.unwrap_or(0) as u64 + ((info.size_h.unwrap_or(0) as u64) << 32);
+        (size > 0).then_some(size)
     });
-    if let Some(sz) = expected_size {
-        log::info!("Replay: stored file size {} bytes (transfer size may differ)", sz);
-    }
-    // Build recording metadata for MP4 embedding
-    let recording_meta = RecordingMeta {
+    let metadata = RecordingMeta {
         record_type: file_meta.as_ref().and_then(|f| f.record_type.clone()),
-        start_time: file_meta.as_ref().and_then(|f| f.start_time.as_ref().map(format_replay_datetime)),
-        end_time: file_meta.as_ref().and_then(|f| f.end_time.as_ref().map(format_replay_datetime)),
+        start_time: file_meta
+            .as_ref()
+            .and_then(|f| f.start_time.as_ref().map(format_replay_datetime)),
+        end_time: file_meta
+            .as_ref()
+            .and_then(|f| f.end_time.as_ref().map(format_replay_datetime)),
         camera_name: None,
     };
-    if let Some(ref rt) = recording_meta.record_type {
-        log::info!("Replay: file recordType = {}", rt);
-    }
-    let dump_limit = dump_replay.as_ref().and_then(|_| Some(dump_replay_limit.unwrap_or(131072)));
     let time_range = if is_download {
-        file_meta.as_ref().and_then(|f| Some((f.start_time.clone()?, f.end_time.clone()?)))
+        file_meta
+            .as_ref()
+            .and_then(|f| Some((f.start_time.clone()?, f.end_time.clone()?)))
     } else {
         None
     };
-    let (mut stream, by_time) = camera
-        .run_task(|cam| {
-            let name = name.to_string();
-            let stream_type = stream_type.to_string();
-            let dump_path = dump_replay.clone();
-            let expected_size = expected_size;
-            let limit = dump_limit;
-            let time_range = time_range.clone();
-            Box::pin(async move {
-                if let Some((start, end)) = time_range {
-                    let stream_num = match stream_type.as_str() {
-                        "mainStream" => 0,
-                        "subStream" => 1,
-                        "externStream" => 2,
-                        other => anyhow::bail!("Unknown stream type: {}", other),
-                    };
-                    log::info!("Download: requesting MSG 143 for {} to {}",
-                        format_replay_datetime(&start), format_replay_datetime(&end));
-                    match cam.start_download_by_time(
-                        start, end, "", stream_num, false, 100, dump_path.clone(), limit,
-                    ).await {
-                        Ok(stream) => return Ok((stream, true)),
-                        Err(neolink_core::Error::CameraServiceUnavailable { id: 143, code: 400 | 405 }) => {
-                            log::info!("Download: camera rejects MSG 143; using replay fallback");
-                        }
-                        Err(err) => return Err(err).context("Could not start video download"),
-                    }
-                }
-                cam.start_replay(&name, &stream_type, speed, false, 100, dump_path, limit, expected_size)
-                    .await
-                    .map(|stream| (stream, false))
-                    .context("Could not start replay on camera")
-            })
-        })
-        .await?;
-
-    let mut frames: u64 = 0;
-    let mut raw_bytes: u64 = 0;
-    let mut raw_replay_buffer: Vec<u8> = Vec::new(); // when writing to file, buffer raw chunks to assemble with mdat
-    let mut video_nals: Vec<Vec<u8>> = Vec::new();
-    let mut timestamps_us: Vec<u32> = Vec::new();
-    let mut aac_data: Vec<u8> = Vec::new();
-    let mut video_fps: u8 = 25;
-    let mut video_type = VideoType::H264;
-    // Skip first 32 bytes only when replay was started with MSG 5 (app parity; set when we receive ReplayStarted).
-    let mut skip_first_32: Option<bool> = None;
-    let deadline = duration.map(|secs| Instant::now() + Duration::from_secs(secs));
-
+    let mut use_time_range = time_range.is_some();
     loop {
-        let res = if let Some(deadline) = deadline {
-            tokio::select! {
-                _ = sleep_until(deadline) => {
-                    log::info!("Replay: {}s duration reached, sending replay stop (MSG 7) and closing file.", duration.unwrap());
-                    break;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Replay: Ctrl+C received, stopping and writing partial file.");
-                    break;
-                }
-                r = stream.get_data() => r,
+        let mut writer = output::RecordingWriter::new(output.as_deref())?;
+        if output.is_none() {
+            writer.discard_payloads();
+        }
+        let started = camera
+            .run_task(|cam| {
+                let name = name.to_string();
+                let stream_type = stream_type.to_string();
+                let dump = dump_replay.clone();
+                let time_range = time_range.clone();
+                Box::pin(async move {
+                    if use_time_range {
+                        let (start, end) = time_range.unwrap();
+                        let stream = stream_number(&stream_type)?;
+                        cam.start_download_by_time(
+                            start,
+                            end,
+                            "",
+                            stream,
+                            false,
+                            100,
+                            dump,
+                            dump_replay_limit,
+                        )
+                        .await
+                        .map_err(anyhow::Error::from)
+                    } else {
+                        cam.start_replay(
+                            &name,
+                            &stream_type,
+                            speed,
+                            false,
+                            100,
+                            dump,
+                            dump_replay_limit,
+                            expected_size,
+                        )
+                        .await
+                        .map_err(anyhow::Error::from)
+                    }
+                })
+            })
+            .await;
+        let mut stream = match started {
+            Ok(stream) => stream,
+            Err(err) if use_time_range && retry_download_error(&err) => {
+                log::warn!(
+                    "Download: MSG 143 start failed: {}; trying legacy replay",
+                    err
+                );
+                writer.close();
+                use_time_range = false;
+                continue;
             }
-        } else {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("Replay: Ctrl+C received, stopping and writing partial file.");
-                    break;
-                }
-                r = stream.get_data() => r,
+            Err(err) => {
+                writer.close();
+                return Err(err);
             }
         };
-
-        match res {
-            Ok(Ok(BcMedia::Iframe(BcMediaIframe { data, microseconds, video_type: frame_type, .. })))
-            | Ok(Ok(BcMedia::Pframe(BcMediaPframe { data, microseconds, video_type: frame_type, .. }))) => {
-                if output.is_some() {
-                    video_nals.push(data);
-                    timestamps_us.push(microseconds);
-                    video_type = frame_type;
-                }
-                frames += 1;
-                if frames <= 5 || frames % 30 == 0 {
-                    log::info!("Replay: received frame {}", frames);
-                }
-            }
-            Ok(Ok(BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })))
-            | Ok(Ok(BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }))) => {
-                if fps > 0 {
-                    video_fps = fps;
-                }
-            }
-            Ok(Ok(BcMedia::Aac(BcMediaAac { data, .. }))) => {
-                if output.is_some() {
-                    aac_data.extend_from_slice(&data);
-                }
-            }
-            Ok(Ok(BcMedia::ReplayStarted(msg_id))) => {
-                skip_first_32 = Some(msg_id == 5);
-            }
-            Ok(Ok(BcMedia::RawReplayChunk(data))) => {
-                raw_bytes += data.len() as u64;
-                if output.is_some() {
-                    raw_replay_buffer.extend_from_slice(&data);
-                }
-                // Log progress; skip the initial "32 bytes" (replay header) to avoid confusion
-                if (raw_bytes > 32 && raw_bytes <= 1024) || raw_bytes % 10240 == 0 {
-                    log::info!("Replay: received {} bytes total (container/raw)", raw_bytes);
-                }
-            }
-            Ok(Ok(BcMedia::StreamEnd)) => {
-                log::info!("Replay: camera signalled end of file, finishing download.");
-                break;
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) | Err(e) => return Err(e.into()),
-        }
-    }
-
-    // Send MSG 7 (replay stop). Use a short timeout so we don't hang if the camera
-    // already closed the stream (e.g. after "no data for 15s").
-    if !by_time {
-        log::info!("Replay: sending MSG 7 (stop) with {}s timeout", 5);
-        const REPLAY_STOP_TIMEOUT_SECS: u64 = 5;
-        let stop_start = std::time::Instant::now();
-        match tokio::time::timeout(
-            tokio::time::Duration::from_secs(REPLAY_STOP_TIMEOUT_SECS),
-            camera.run_task(|cam| {
-                let name = name.to_string();
-                Box::pin(
-                    async move { cam.replay_stop(&name).await.context("Replay stop failed") },
-                )
-            }),
+        let mut result = receive_recording(&mut stream, &mut writer, duration).await;
+        let cleanup = stop_recording(
+            camera,
+            &mut stream,
+            if use_time_range { None } else { Some(name) },
         )
-        .await
-        {
-            Ok(Ok(())) => {
-                log::info!("Replay: MSG 7 (stop) completed successfully in {:?}", stop_start.elapsed());
-            }
-            Ok(Err(e)) => {
-                log::warn!("Replay: MSG 7 (stop) failed after {:?}: {:?}", stop_start.elapsed(), e);
-            }
-            Err(_) => {
-                log::warn!(
-                    "Replay: MSG 7 (stop) timed out after {}s (camera may have already closed stream)",
-                    REPLAY_STOP_TIMEOUT_SECS
-                );
+        .await;
+        if let Err(err) = cleanup {
+            if result.is_ok() {
+                result = Err(err);
             }
         }
-    }
-    // Wait for protocol cleanup (MSG 144 for a download) before writing output.
-    stream.shutdown().await.context("Could not shut down replay/download stream")?;
-    if is_download && frames == 0 && raw_replay_buffer.is_empty() {
-        anyhow::bail!("Camera ended the download without any video data");
-    }
-    if let Some(p) = &output {
-        if !raw_replay_buffer.is_empty() {
-            let stream = stream_for_mp4_assembly(&raw_replay_buffer, skip_first_32);
-            let to_try: &[u8] = slice_from_ftyp(stream).unwrap_or(stream);
-            match assemble_mp4_with_mdat(to_try) {
-                Ok(assembled) => {
-                    tokio::fs::write(p, &assembled).await.context("Write assembled MP4")?;
-                    patch_e1_avcc_if_needed(p).context("Patch E1 avcC for playback")?;
-                    patch_avc1_colour_if_needed(p).context("Patch avc1 colour for playback")?;
-                    println!(
-                        "Wrote {} bytes (assembled MP4) to {}",
-                        assembled.len(),
-                        p.display()
-                    );
-                }
-                Err(e) => {
-                    log::warn!("Replay: could not assemble MP4: {:?}; trying BcMedia decode", e);
-                    let stream_to_decode = find_bcmedia_magic_offset(stream)
-                        .map(|off| &stream[off..])
-                        .unwrap_or(stream);
-                    let stream_to_decode_len = stream_to_decode.len();
-                    // Save raw stream for offline analysis
-                    let bcmedia_dump_path = p.with_extension("replay.bin");
-                    if let Err(e) = tokio::fs::write(&bcmedia_dump_path, stream_to_decode).await {
-                        log::warn!("Replay: could not write BcMedia dump: {}", e);
-                    } else {
-                        log::info!("Replay: BcMedia stream ({} bytes) saved to {}", stream_to_decode_len, bcmedia_dump_path.display());
-                    }
-                    // Decode BcMedia frames and mux to MP4
-                    const DECODE_MUX_TIMEOUT_SECS: u64 = 60;
-                    let stream_to_decode = stream_to_decode.to_vec();
-                    let decoded_opt = match tokio::time::timeout(
-                        tokio::time::Duration::from_secs(DECODE_MUX_TIMEOUT_SECS),
-                        tokio::task::spawn_blocking(move || try_decode_bcmedia_nals(&stream_to_decode)),
-                    )
-                    .await
-                    {
-                        Ok(Ok(n)) => n,
-                        Ok(Err(e)) => { log::warn!("Replay: BcMedia decode failed: {:?}", e); None }
-                        Err(_) => { log::warn!("Replay: BcMedia decode timed out after {}s", DECODE_MUX_TIMEOUT_SECS); None }
-                    };
-                    if let Some(BcMediaDecoded { nals, video_type, fps, timestamps_us, aac_data }) = decoded_opt {
-                        write_video_output(
-                            &nals,
-                            video_type,
-                            &aac_data,
-                            fps,
-                            &timestamps_us,
-                            p,
-                            &recording_meta,
-                        )
-                        .await?;
-                    } else {
-                        let raw_path = if p.extension().map(|e| e == "mp4").unwrap_or(false) {
-                            p.with_extension("replay.raw.bin")
-                        } else {
-                            p.clone()
-                        };
-                        tokio::fs::write(&raw_path, &raw_replay_buffer).await.context("Write raw replay")?;
-                        if raw_path.as_path() != p.as_path() {
-                            println!(
-                                "Replay stream is not valid MP4 or BcMedia. Wrote {} bytes to {} for inspection.",
-                                raw_replay_buffer.len(),
-                                raw_path.display()
-                            );
-                        } else {
-                            patch_e1_avcc_if_needed(&raw_path).context("Patch E1 avcC for playback")?;
-                            patch_avc1_colour_if_needed(&raw_path).context("Patch avc1 colour for playback")?;
-                            println!("Wrote {} bytes (raw container) to {}", raw_replay_buffer.len(), raw_path.display());
-                        }
-                    }
-                }
-            }
-        } else if frames > 0 {
-            write_video_output(
-                &video_nals,
-                video_type,
-                &aac_data,
-                video_fps,
-                &timestamps_us,
-                p,
-                &recording_meta,
-            )
-            .await?;
+        if matches!(result, Ok(true)) && is_download && !writer.has_video() {
+            result = Err(neolink_core::Error::Other("Camera ended download without video").into());
         }
-    } else {
-        if raw_bytes > 0 || frames > 0 {
-            log::info!("Replay: received {} bytes, {} frames (use --output <path> to save to file)", raw_bytes, frames);
+        let retry = use_time_range && result.as_ref().err().map_or(false, retry_download_error);
+        // An accepted but failed ID 143 attempt has a distinct partial result; never append the replay retry.
+        let attempt_output = if retry {
+            output.as_ref().map(|p| {
+                p.with_file_name(format!(
+                    "{}.id143.{}",
+                    p.file_stem().unwrap_or_default().to_string_lossy(),
+                    p.extension().unwrap_or_default().to_string_lossy()
+                ))
+            })
+        } else {
+            output.clone()
+        };
+        let saved = save_recording(
+            &mut writer,
+            attempt_output.as_deref(),
+            &metadata,
+            !matches!(result, Ok(true)),
+        )
+        .await;
+        if saved.is_err() {
+            log::error!(
+                "Recording spool retained at {}",
+                writer.directory().display()
+            );
+        } else {
+            writer.close();
         }
+        saved?;
+        if retry {
+            log::warn!(
+                "Download: MSG 143 receive failed: {}; trying legacy replay",
+                result.unwrap_err()
+            );
+            use_time_range = false;
+            continue;
+        }
+        return result.map(|_| ());
     }
-
-    drop(stream);
-    Ok(())
 }
 
-/// Download by time range (MSG 143). Stream ends on response 331; stop is MSG 144 (sent on drop).
+fn stream_number(stream: &str) -> Result<u32> {
+    match stream {
+        "mainStream" => Ok(0),
+        "subStream" => Ok(1),
+        "externStream" => Ok(2),
+        other => anyhow::bail!("Unknown stream type: {}", other),
+    }
+}
+
 async fn run_download_by_time(
     camera: &crate::common::NeoInstance,
     start_time: ReplayDateTime,
@@ -1244,204 +904,68 @@ async fn run_download_by_time(
     dump_replay: Option<std::path::PathBuf>,
     dump_replay_limit: Option<usize>,
 ) -> Result<()> {
-    let stream_type_u32 = match stream_type {
-        "mainStream" => 0,
-        "subStream" => 1,
-        "externStream" => 2,
-        other => anyhow::bail!("Unknown stream type: {}", other),
-    };
-    const DEFAULT_DUMP_LIMIT: usize = 131072;
-    let dump_limit = dump_replay.as_ref().map(|_| dump_replay_limit.unwrap_or(DEFAULT_DUMP_LIMIT));
-
-    log::info!(
-        "Replay download-by-time: {:?} to {:?} stream={}",
-        start_time,
-        end_time,
-        stream_type
-    );
-
-    // Build metadata from the time range (no FileInfo available for download-by-time)
-    let recording_meta = RecordingMeta {
-        record_type: None,
+    let stream_type = stream_number(stream_type)?;
+    let metadata = RecordingMeta {
         start_time: Some(format_replay_datetime(&start_time)),
         end_time: Some(format_replay_datetime(&end_time)),
-        camera_name: None,
+        ..Default::default()
     };
-
-    let mut stream = camera
+    let mut writer = output::RecordingWriter::new(Some(&output))?;
+    let started = camera
         .run_task(|cam| {
             let start_time = start_time.clone();
             let end_time = end_time.clone();
-            let dump_path = dump_replay.clone();
-            let limit = dump_limit;
+            let dump = dump_replay.clone();
             Box::pin(async move {
                 cam.start_download_by_time(
                     start_time,
                     end_time,
                     "",
-                    stream_type_u32,
+                    stream_type,
                     false,
                     100,
-                    dump_path,
-                    limit,
+                    dump,
+                    dump_replay_limit,
                 )
                 .await
-                .context("Could not start download-by-time on camera")
+                .map_err(anyhow::Error::from)
             })
         })
-        .await?;
-
-    let mut frames: u64 = 0;
-    let mut raw_bytes: u64 = 0;
-    let mut raw_replay_buffer: Vec<u8> = Vec::new();
-    let mut video_nals: Vec<Vec<u8>> = Vec::new();
-    let mut timestamps_us: Vec<u32> = Vec::new();
-    let mut aac_data: Vec<u8> = Vec::new();
-    let mut video_fps: u8 = 25;
-    let mut video_type = VideoType::H264;
-    let deadline = duration.map(|secs| Instant::now() + Duration::from_secs(secs));
-
-    loop {
-        let res = if let Some(deadline) = deadline {
-            tokio::select! {
-                _ = sleep_until(deadline) => {
-                    log::info!("DownloadByTime: {}s duration reached, closing (MSG 144 sent on drop).", duration.unwrap());
-                    break;
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("DownloadByTime: Ctrl+C received, writing partial file.");
-                    break;
-                }
-                r = stream.get_data() => r,
-            }
-        } else {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    log::info!("DownloadByTime: Ctrl+C received, writing partial file.");
-                    break;
-                }
-                r = stream.get_data() => r,
-            }
-        };
-
-        match res {
-            Ok(Ok(BcMedia::Iframe(BcMediaIframe { data, microseconds, video_type: frame_type, .. })))
-            | Ok(Ok(BcMedia::Pframe(BcMediaPframe { data, microseconds, video_type: frame_type, .. }))) => {
-                video_nals.push(data);
-                timestamps_us.push(microseconds);
-                video_type = frame_type;
-                frames += 1;
-                if frames <= 5 || frames % 30 == 0 {
-                    log::info!("DownloadByTime: received frame {}", frames);
-                }
-            }
-            Ok(Ok(BcMedia::InfoV1(BcMediaInfoV1 { fps, .. })))
-            | Ok(Ok(BcMedia::InfoV2(BcMediaInfoV2 { fps, .. }))) => {
-                if fps > 0 {
-                    video_fps = fps;
-                }
-            }
-            Ok(Ok(BcMedia::Aac(BcMediaAac { data, .. }))) => aac_data.extend_from_slice(&data),
-            Ok(Ok(BcMedia::RawReplayChunk(data))) => {
-                raw_bytes += data.len() as u64;
-                raw_replay_buffer.extend_from_slice(&data);
-                if (raw_bytes > 32 && raw_bytes <= 1024) || raw_bytes % 10240 == 0 {
-                    log::info!("DownloadByTime: received {} bytes total (container/raw)", raw_bytes);
-                }
-            }
-            Ok(Ok(BcMedia::StreamEnd)) => {
-                log::info!("DownloadByTime: camera signalled end of file, finishing download.");
-                break;
-            }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) | Err(e) => {
-                if frames == 0 && raw_bytes == 0 {
-                    return Err(anyhow::anyhow!(
-                        "Camera rejected download-by-time (MSG 143). This camera may not support \
-                         time-range downloads. Use 'replay download --name <file>' instead."
-                    ));
-                }
-                return Err(e.into());
-            }
+        .await;
+    let mut stream = match started {
+        Ok(stream) => stream,
+        Err(err) => {
+            writer.close();
+            return Err(err);
+        }
+    };
+    let mut result = receive_recording(&mut stream, &mut writer, duration).await;
+    let cleanup = stop_recording(camera, &mut stream, None).await;
+    if let Err(err) = cleanup {
+        if result.is_ok() {
+            result = Err(err);
         }
     }
-
-    stream.shutdown().await.context("Could not stop download (MSG 144)")?;
-
-    if !raw_replay_buffer.is_empty() {
-        let stream = stream_for_mp4_assembly(&raw_replay_buffer, None);
-        let to_try: &[u8] = slice_from_ftyp(stream).unwrap_or(stream);
-        match assemble_mp4_with_mdat(to_try) {
-            Ok(assembled) => {
-                tokio::fs::write(&output, &assembled).await.context("Write assembled MP4")?;
-                patch_e1_avcc_if_needed(&output).context("Patch E1 avcC for playback")?;
-                patch_avc1_colour_if_needed(&output).context("Patch avc1 colour for playback")?;
-                println!(
-                    "Wrote {} bytes (assembled MP4 with mdat) to {}. If ffplay shows 'unspecified pixel format', try: ffplay -vf format=yuv420p {}",
-                    assembled.len(),
-                    output.display(),
-                    output.display()
-                );
-            }
-            Err(e) => {
-                log::warn!(
-                    "DownloadByTime: could not assemble MP4 with mdat: {:?}; trying BcMedia decode",
-                    e
-                );
-                let stream_to_decode = find_bcmedia_magic_offset(stream)
-                    .map(|off| &stream[off..])
-                    .unwrap_or(stream);
-                if let Some(BcMediaDecoded { nals, video_type, fps, timestamps_us, aac_data }) = try_decode_bcmedia_nals(stream_to_decode) {
-                    write_video_output(
-                        &nals,
-                        video_type,
-                        &aac_data,
-                        fps,
-                        &timestamps_us,
-                        &output,
-                        &recording_meta,
-                    )
-                    .await?;
-                } else {
-                    // Stream is not ftyp MP4 and BcMedia decode yielded no video; don't write to .mp4.
-                    let raw_path = if output.extension().map(|e| e == "mp4").unwrap_or(false) {
-                        output.with_extension("replay.bin")
-                    } else {
-                        output.clone()
-                    };
-                    tokio::fs::write(&raw_path, &raw_replay_buffer).await.context("Write raw replay")?;
-                    if raw_path.as_path() != output.as_path() {
-                        println!(
-                            "Replay stream is not valid MP4 or BcMedia (e.g. camera sent XML or other format). Wrote {} bytes to {} for inspection.",
-                            raw_replay_buffer.len(),
-                            raw_path.display()
-                        );
-                    } else {
-                        patch_e1_avcc_if_needed(&raw_path).context("Patch E1 avcC for playback")?;
-                        patch_avc1_colour_if_needed(&raw_path).context("Patch avc1 colour for playback")?;
-                        println!(
-                            "Wrote {} bytes (raw container) to {}. If ffplay shows 'unspecified pixel format', try: ffplay -vf format=yuv420p {}",
-                            raw_replay_buffer.len(),
-                            raw_path.display(),
-                            raw_path.display()
-                        );
-                    }
-                }
-            }
-        }
-    } else if frames > 0 {
-        write_video_output(
-            &video_nals,
-            video_type,
-            &aac_data,
-            video_fps,
-            &timestamps_us,
-            &output,
-            &recording_meta,
-        )
-        .await?;
+    if matches!(result, Ok(true)) && !writer.has_video() {
+        result = Err(anyhow::anyhow!("Camera ended download without video"));
     }
-    Ok(())
+    let saved = save_recording(
+        &mut writer,
+        Some(&output),
+        &metadata,
+        !matches!(result, Ok(true)),
+    )
+    .await;
+    if saved.is_err() {
+        log::error!(
+            "Recording spool retained at {}",
+            writer.directory().display()
+        );
+    } else {
+        writer.close();
+    }
+    saved?;
+    result.map(|_| ())
 }
 
 /// Entry point for the replay subcommand
@@ -1460,13 +984,11 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                 .run_task(|cam| {
                     let st = start_time.clone();
                     let et = end_time.clone();
-                    Box::pin(
-                        async move {
-                            cam.get_day_records(st, et)
-                                .await
-                                .context("Could not get day records from camera")
-                        },
-                    )
+                    Box::pin(async move {
+                        cam.get_day_records(st, et)
+                            .await
+                            .context("Could not get day records from camera")
+                    })
                 })
                 .await?;
 
@@ -1482,26 +1004,27 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                         move |cam| {
                             let st = st.clone();
                             let et = et.clone();
-                            Box::pin(
-                                async move {
-                                    cam.get_file_list_handle("subStream", cmdline::FILE_SEARCH_RECORD_TYPES, st, et)
-                                        .await
-                                        .context("Could not get file list handle")
-                                },
-                            )
+                            Box::pin(async move {
+                                cam.get_file_list_handle(
+                                    "subStream",
+                                    cmdline::FILE_SEARCH_RECORD_TYPES,
+                                    st,
+                                    et,
+                                )
+                                .await
+                                .context("Could not get file list handle")
+                            })
                         }
                     })
                     .await?;
                 if let Some(handle) = handle_info.handle {
                     let files = camera
                         .run_task(|cam| {
-                            Box::pin(
-                                async move {
-                                    cam.get_file_list_by_handle(handle)
-                                        .await
-                                        .context("Could not get file list")
-                                },
-                            )
+                            Box::pin(async move {
+                                cam.get_file_list_by_handle(handle)
+                                    .await
+                                    .context("Could not get file list")
+                            })
                         })
                         .await?;
                     let n = files.len();
@@ -1533,13 +1056,11 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                     let et = end_time.clone();
                     let stream = stream.clone();
                     let record_type = record_type.clone();
-                    Box::pin(
-                        async move {
-                            cam.get_file_list_handle(&stream, &record_type, st, et)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("{}", e))
-                        },
-                    )
+                    Box::pin(async move {
+                        cam.get_file_list_handle(&stream, &record_type, st, et)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("{}", e))
+                    })
                 })
                 .await;
 
@@ -1563,13 +1084,11 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
 
             let files = camera
                 .run_task(|cam| {
-                    Box::pin(
-                        async move {
-                            cam.get_file_list_by_handle(handle)
-                                .await
-                                .context("Could not get file list from camera")
-                        },
-                    )
+                    Box::pin(async move {
+                        cam.get_file_list_by_handle(handle)
+                            .await
+                            .context("Could not get file list from camera")
+                    })
                 })
                 .await?;
 
@@ -1628,7 +1147,8 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
                 name,
                 stream_type
             );
-            let output = output.ok_or_else(|| anyhow::anyhow!("Download requires --output <file>"))?;
+            let output =
+                output.ok_or_else(|| anyhow::anyhow!("Download requires --output <file>"))?;
             run_replay_or_download(
                 &camera,
                 &name,
@@ -1651,8 +1171,8 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             dump_replay,
             dump_replay_limit,
         } => {
-            let output =
-                output.ok_or_else(|| anyhow::anyhow!("download-by-time requires --output <file>"))?;
+            let output = output
+                .ok_or_else(|| anyhow::anyhow!("download-by-time requires --output <file>"))?;
             let (sy, sm, sd) = parse_date(&start)?;
             let end_str = end.as_deref().unwrap_or(&start);
             let (ey, em, ed) = parse_date(end_str)?;
@@ -1682,7 +1202,10 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             let start_time = date_to_replay_start(sy, sm, sd);
             let end_time = date_to_replay_end(ey, em, ed);
 
-            let alarm_list: Vec<String> = alarm_types.split(',').map(|s| s.trim().to_string()).collect();
+            let alarm_list: Vec<String> = alarm_types
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
             let alarm_refs: Vec<&str> = alarm_list.iter().map(|s| s.as_str()).collect();
 
             // START: send search params, get handle
@@ -1782,13 +1305,11 @@ pub(crate) async fn main(opt: Opt, reactor: NeoReactor) -> Result<()> {
             camera
                 .run_task(|cam| {
                     let name = name.clone();
-                    Box::pin(
-                        async move {
-                            cam.replay_stop(&name)
-                                .await
-                                .context("Could not send replay stop to camera")
-                        },
-                    )
+                    Box::pin(async move {
+                        cam.replay_stop(&name)
+                            .await
+                            .context("Could not send replay stop to camera")
+                    })
                 })
                 .await?;
             println!("Replay stop sent.");
@@ -1823,8 +1344,17 @@ fn print_day_records(records: &DayRecords) {
 
 /// AI detection tag names from recordType.
 const AI_TAGS: &[&str] = &[
-    "people", "vehicle", "face", "dog_cat", "package", "visitor", "cry",
-    "crossline", "intrusion", "loitering", "nonmotorveh",
+    "people",
+    "vehicle",
+    "face",
+    "dog_cat",
+    "package",
+    "visitor",
+    "cry",
+    "crossline",
+    "intrusion",
+    "loitering",
+    "nonmotorveh",
 ];
 
 fn print_file_list(files: &[FileInfo]) {
@@ -1838,12 +1368,26 @@ fn print_file_list(files: &[FileInfo]) {
         let size_l = f.size_l.unwrap_or(0);
         let size_h = f.size_h.unwrap_or(0);
         let size_bytes = size_l as u64 + ((size_h as u64) << 32);
-        let start = f.start_time.as_ref().map(|t| {
-            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
-        }).unwrap_or_else(|| "—".to_string());
-        let end = f.end_time.as_ref().map(|t| {
-            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}", t.year, t.month, t.day, t.hour, t.minute, t.second)
-        }).unwrap_or_else(|| "—".to_string());        
+        let start = f
+            .start_time
+            .as_ref()
+            .map(|t| {
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                    t.year, t.month, t.day, t.hour, t.minute, t.second
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
+        let end = f
+            .end_time
+            .as_ref()
+            .map(|t| {
+                format!(
+                    "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+                    t.year, t.month, t.day, t.hour, t.minute, t.second
+                )
+            })
+            .unwrap_or_else(|| "—".to_string());
         let stream = f.stream_type.as_deref().unwrap_or("—");
         let rec_type = f.record_type.as_deref().unwrap_or("");
         // Split recordType into trigger (md/sched/manual/pir/io) and AI detections
@@ -1864,6 +1408,9 @@ fn print_file_list(files: &[FileInfo]) {
         } else {
             format!("{} MB", size_bytes / (1024 * 1024))
         };
-        println!("  {}  {}  {}  {}  {}  {}{}", name, size_str, start, end, stream, rec_type, ai_str);
+        println!(
+            "  {}  {}  {}  {}  {}  {}{}",
+            name, size_str, start, end, stream, rec_type, ai_str
+        );
     }
 }

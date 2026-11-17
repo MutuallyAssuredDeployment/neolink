@@ -89,7 +89,7 @@ pub enum ReplayCommand {
         #[arg(long)]
         dump_replay_limit: Option<usize>,
     },
-    /// Download by time range (MSG 143 XML; ends on response 300 or 331)
+    /// Download by time range (MSG 143 XML; supports multipart and legacy downloads)
     DownloadByTime {
         /// Start date (YYYY-MM-DD); time 00:00:00
         #[arg(long)]
@@ -103,7 +103,7 @@ pub enum ReplayCommand {
         /// Output path for the downloaded file (e.g. .mp4)
         #[arg(long)]
         output: Option<std::path::PathBuf>,
-        /// Stop after N seconds if camera does not send response 331
+        /// Explicit wall-clock limit in seconds; saves a partial recording
         #[arg(long)]
         duration: Option<u64>,
         /// Debug: write raw replay stream to this file (default limit 128KB; use --dump-replay-limit 0 for full).

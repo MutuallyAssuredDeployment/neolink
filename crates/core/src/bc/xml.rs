@@ -1859,6 +1859,9 @@ pub struct FileInfoList {
 /// channelId, supportSub, streamType, startTime. Other fields follow for file-list/stop etc.
 #[derive(PartialEq, Eq, Default, Debug, Deserialize, Serialize, Clone)]
 pub struct FileInfo {
+    /// Number of recording sections in a time-range download acknowledgement.
+    #[serde(rename = "FileCount", skip_serializing_if = "Option::is_none")]
+    pub file_count: Option<u32>,
     /// UID (optional; Android sends when non-empty; use e.g. 0 for MSG 8 start replay on E1)
     #[serde(rename = "uid", skip_serializing_if = "Option::is_none")]
     pub uid: Option<u32>,

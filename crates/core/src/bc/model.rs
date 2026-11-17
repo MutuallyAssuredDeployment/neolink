@@ -410,9 +410,37 @@ impl BcHeader {
     }
 }
 
-pub(super) fn has_payload_offset(class: u16) -> bool {
-    // Only the legacy login and its negotiation reply use a 20-byte header.
-    // Replay packets may carry an opaque value in the status/class word, but
-    // still have the payload offset at byte 20 (e.g. Argus 4 Pro class 0x6afb).
-    !matches!(class, 0x6514 | 0x6614)
+pub(super) fn has_payload_offset(class: u16, msg_id: u32) -> bool {
+    // Preserve the established header layout outside replay. Argus replay packets
+    // use opaque classes (e.g. 0x6afb), but still include the offset at byte 20.
+    matches!(class, 0x6414 | 0x0000)
+        || (!matches!(class, 0x6514 | 0x6614)
+            && matches!(
+                msg_id,
+                MSG_ID_REPLAY_START
+                    | MSG_ID_REPLAY_START_ALT
+                    | MSG_ID_REPLAY_DESKTOP
+                    | MSG_ID_DOWNLOAD_BY_TIME
+            ))
+}
+
+#[cfg(test)]
+mod replay_header_tests {
+    use super::*;
+    #[test]
+    fn opaque_class_extension_is_scoped_to_replay() {
+        for msg_id in [
+            MSG_ID_REPLAY_START,
+            MSG_ID_REPLAY_START_ALT,
+            MSG_ID_REPLAY_DESKTOP,
+            MSG_ID_DOWNLOAD_BY_TIME,
+        ] {
+            assert!(has_payload_offset(0x6afb, msg_id));
+            assert!(!has_payload_offset(0x6514, msg_id));
+            assert!(!has_payload_offset(0x6614, msg_id));
+        }
+        assert!(!has_payload_offset(0x6afb, 3));
+        assert!(has_payload_offset(0x6414, 3));
+        assert!(has_payload_offset(0, 3));
+    }
 }

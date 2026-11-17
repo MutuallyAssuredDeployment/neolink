@@ -252,7 +252,7 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
 
     let (buf, payload_offset) = error_context(
         "Payload Offset is missing",
-        cond(has_payload_offset(class), le_u32),
+        cond(has_payload_offset(class, msg_id), le_u32),
     )(buf)?;
 
     Ok((

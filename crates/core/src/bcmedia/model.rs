@@ -15,14 +15,32 @@ pub enum BcMedia {
     Adpcm(BcMediaAdpcm),
     /// Raw container data (e.g. MP4) from replay; receive-only, not BcMedia-framed.
     RawReplayChunk(Vec<u8>),
-    /// Replay stream started with this message ID (5, 8, or 0x17d). Receive-only; consumer uses it to
-    /// skip the first 32 bytes only when msg_id == 5 (app parity per BCMEDIA_REPLAY_FORMAT §5).
+    /// Selected replay wire format. Receive-only; raw bytes must not be decoded again as BcMedia.
+    ReplayFormat(ReplayFormat),
+    /// Another recording section follows (e.g. response 331 with section metadata).
+    ReplaySection,
+    /// Accepted replay request ID (5, 8 or 381). Receive-only diagnostic event.
     ReplayStarted(u16),
-    /// Replay/download stream ended normally (camera sent response 300 or 331). Receive-only sentinel.
+    /// Replay/download completed by a final response, container size or legacy inactivity. Receive-only.
     StreamEnd,
 }
+
+/// Formats supported by the replay receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFormat {
+    /// Framed video/audio, decoded to the normal BcMedia variants.
+    BcMedia,
+    /// ISO BMFF/MP4 container bytes.
+    Mp4,
+    /// Elementary video with existing start codes.
+    AnnexB,
+    /// One H.264 NAL per BC binary payload; start codes are added by the decoder.
+    H264Nal,
+    /// Unrecognized bytes, retained for offline inspection.
+    Opaque,
+}
 //
-pub(super) const MAGIC_HEADER_BCMEDIA_INFO_V1: u32 = 0x31303031;
+pub(crate) const MAGIC_HEADER_BCMEDIA_INFO_V1: u32 = 0x31303031;
 
 /// The start of a BcMedia stream contains this message
 /// which describes the data to follow
@@ -66,7 +84,7 @@ pub struct BcMediaInfoV1 {
     // unknown: u16
 }
 //
-pub(super) const MAGIC_HEADER_BCMEDIA_INFO_V2: u32 = 0x32303031;
+pub(crate) const MAGIC_HEADER_BCMEDIA_INFO_V2: u32 = 0x32303031;
 
 /// The start of a BcMedia stream contains this message
 /// which describes the data to follow
@@ -111,8 +129,8 @@ pub struct BcMediaInfoV2 {
 }
 
 // IFrame magics include the channel number in them
-pub(super) const MAGIC_HEADER_BCMEDIA_IFRAME: u32 = 0x63643030;
-pub(super) const MAGIC_HEADER_BCMEDIA_IFRAME_LAST: u32 = 0x63643039;
+pub(crate) const MAGIC_HEADER_BCMEDIA_IFRAME: u32 = 0x63643030;
+pub(crate) const MAGIC_HEADER_BCMEDIA_IFRAME_LAST: u32 = 0x63643039;
 
 /// Video Types for I/PFrame
 #[derive(Debug, Clone, Copy)]
@@ -162,8 +180,8 @@ impl std::fmt::Debug for BcMediaIframe {
 }
 
 // PFrame magics include the channel number in them
-pub(super) const MAGIC_HEADER_BCMEDIA_PFRAME: u32 = 0x63643130;
-pub(super) const MAGIC_HEADER_BCMEDIA_PFRAME_LAST: u32 = 0x63643139;
+pub(crate) const MAGIC_HEADER_BCMEDIA_PFRAME: u32 = 0x63643130;
+pub(crate) const MAGIC_HEADER_BCMEDIA_PFRAME_LAST: u32 = 0x63643139;
 
 /// This is a BcMedia video PFrame.
 #[derive(Clone)]
@@ -199,7 +217,7 @@ impl std::fmt::Debug for BcMediaPframe {
     }
 }
 
-pub(super) const MAGIC_HEADER_BCMEDIA_AAC: u32 = 0x62773530;
+pub(crate) const MAGIC_HEADER_BCMEDIA_AAC: u32 = 0x62773530;
 
 /// This contains BcMedia audio data in AAC format
 #[derive(Debug, Clone)]
@@ -256,9 +274,9 @@ impl BcMediaAac {
     }
 }
 
-pub(super) const MAGIC_HEADER_BCMEDIA_ADPCM: u32 = 0x62773130;
+pub(crate) const MAGIC_HEADER_BCMEDIA_ADPCM: u32 = 0x62773130;
 
-pub(super) const MAGIC_HEADER_BCMEDIA_ADPCM_DATA: u16 = 0x0100;
+pub(crate) const MAGIC_HEADER_BCMEDIA_ADPCM_DATA: u16 = 0x0100;
 
 /// This contains BcMedia audio data in ADPCM format
 #[derive(Debug, Clone)]
