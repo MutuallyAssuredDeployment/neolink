@@ -73,4 +73,27 @@ pub use bc_protocol::Error;
 
 pub(crate) use bc_protocol::{Credentials, Result};
 
-pub(crate) type NomErrorType<'a> = nom::error::VerboseError<&'a [u8]>;
+pub(crate) type NomErrorType<'a> = nom_language::error::VerboseError<&'a [u8]>;
+
+#[cfg(test)]
+pub(crate) fn assert_fragmented_parse<T>(
+    sample: &[u8],
+    mut deserialize: impl FnMut(&mut bytes::BytesMut) -> Result<T>,
+) {
+    for split in 0..sample.len() {
+        let mut buf = bytes::BytesMut::from(&sample[..split]);
+        assert!(
+            matches!(deserialize(&mut buf), Err(Error::NomIncomplete(_))),
+            "Incomplete packet at split {} must request more data", split,
+        );
+        assert_eq!(
+            &buf[..], &sample[..split], "Incomplete input must stay buffered",
+        );
+        buf.extend_from_slice(&sample[split..]);
+        assert!(
+            deserialize(&mut buf).is_ok(),
+            "Complete packet must parse after split {}", split,
+        );
+        assert!(buf.is_empty(), "Complete packet must be consumed exactly once");
+    }
+}

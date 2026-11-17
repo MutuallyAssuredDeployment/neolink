@@ -25,6 +25,7 @@ mod output;
 mod gst;
 
 /// Annex B start code (4-byte) for H.264/HEVC NAL.
+#[cfg(test)]
 const ANNEX_B_START: &[u8] = &[0x00, 0x00, 0x00, 0x01];
 
 /// Scan for the first BcMedia 4-byte LE magic (InfoV1/2, IFRAME, PFRAME, AAC). Returns offset or None.
@@ -270,7 +271,9 @@ use bytes::{Buf, BytesMut};
 use neolink_core::bc::xml::{DayRecords, FileInfo, ReplayDateTime};
 #[cfg(test)]
 use neolink_core::bcmedia::codex::BcMediaCodex;
-use neolink_core::bcmedia::model::{BcMedia, VideoType};
+use neolink_core::bcmedia::model::BcMedia;
+#[cfg(test)]
+use neolink_core::bcmedia::model::VideoType;
 use tokio::time::{sleep_until, Duration, Instant};
 #[cfg(test)]
 use tokio_util::codec::Decoder;

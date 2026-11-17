@@ -261,9 +261,6 @@ pub(crate) struct BcContext {
     pub(crate) in_bin_mode: RefCell<HashSet<u16>>,
     pub(crate) encryption_protocol: EncryptionProtocol,
     pub(crate) debug: bool,
-    /// If true, replay binary payloads (MSG 5/8) are passed through without decryption.
-    /// Set via env NEOLINK_REPLAY_RAW=1 to test cameras that send replay in plaintext.
-    pub(crate) replay_raw_binary: bool,
 }
 
 impl Bc {
@@ -301,15 +298,11 @@ impl Bc {
 
 impl BcContext {
     pub(crate) fn new(credentials: Credentials) -> BcContext {
-        let replay_raw_binary = std::env::var("NEOLINK_REPLAY_RAW")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
         BcContext {
             credentials,
             in_bin_mode: RefCell::new(HashSet::new()),
             encryption_protocol: EncryptionProtocol::Unencrypted,
             debug: false,
-            replay_raw_binary,
         }
     }
 
@@ -320,7 +313,6 @@ impl BcContext {
             in_bin_mode: RefCell::new(HashSet::new()),
             encryption_protocol,
             debug: false,
-            replay_raw_binary: false,
         }
     }
 
@@ -332,18 +324,14 @@ impl BcContext {
         &self.encryption_protocol
     }
 
-    pub(crate) fn binary_on(&mut self, msg_id: u16) {
-        self.in_bin_mode.borrow_mut().insert(msg_id);
+    /// Enable binary mode for a message number through a shared context reference.
+    pub(crate) fn binary_on(&self, msg_num: u16) {
+        self.in_bin_mode.borrow_mut().insert(msg_num);
     }
 
     #[allow(unused)] // Used in tests
     pub(crate) fn binary_off(&mut self, msg_id: u16) {
         self.in_bin_mode.borrow_mut().remove(&msg_id);
-    }
-
-    /// Enable binary mode for msg_id (used from parser with &context).
-    pub(crate) fn binary_on_shared(&self, msg_id: u16) {
-        self.in_bin_mode.borrow_mut().insert(msg_id);
     }
 
     pub(crate) fn debug_on(&mut self) {
