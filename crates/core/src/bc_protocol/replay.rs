@@ -148,13 +148,25 @@ pub fn build_desktop_replay_payload(channel_id: u8, path: &str) -> Vec<u8> {
 }
 
 /// BC_DOWNLOAD_BY_TIME_INFO size (0x480 = 1152 bytes). Layout from APK JNA + native path at +0x60.
+#[expect(
+    dead_code,
+    reason = "Retained native SDK layout reference for future SDK integration; MSG 143 uses XML"
+)]
 pub const BC_DOWNLOAD_BY_TIME_INFO_SIZE: usize = 0x480;
+#[expect(
+    dead_code,
+    reason = "Retained path capacity of the native SDK layout; not used by the wire protocol"
+)]
 const SAVE_PATH_MAX: usize = 1024; // cSaveFileName at +0x60, max 1024 bytes
 
 /// Build the native SDK's 0x480-byte BC_DOWNLOAD_BY_TIME_INFO struct.
 /// This struct is not the XML payload sent over the wire by MSG 143.
 /// Layout: iChannel (4), cUID (32), logicChnBitmap (8), startTime (6×i32), endTime (6×i32),
 /// padding (4), cSaveFileName (1024), fileSize/curSize/processed (8 each), streamType (4), padding (4).
+#[expect(
+    dead_code,
+    reason = "Retained reverse-engineered native SDK structure builder; MSG 143 sends XML instead"
+)]
 pub fn build_download_by_time_payload(
     channel_id: u8,
     uid: &[u8],

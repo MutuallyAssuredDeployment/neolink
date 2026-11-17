@@ -2235,7 +2235,7 @@ fn test_binary_deser() {
 fn test_enc3_extension() {
     let _ = env_logger::builder().is_test(true).try_init();
     let sample = indoc!(
-        r#"<?xml version="1.0\" encoding="UTF-8" ?>
+        r#"<?xml version="1.0" encoding="UTF-8" ?>
         <Extension version="1.1">
         <encryptLen>1024</encryptLen>
         <binaryData>1</binaryData>

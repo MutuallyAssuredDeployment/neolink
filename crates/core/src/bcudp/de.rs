@@ -6,10 +6,10 @@ use nom::{
     combinator::*,
     error::{context as error_context, ContextError, ErrorKind, ParseError},
     number::streaming::*,
-    Err,
+    Err, Parser,
 };
 
-type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
+type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
 fn make_error<I, E>(input: I, ctx: &'static str, kind: ErrorKind) -> E
 where
@@ -22,7 +22,7 @@ where
 impl BcUdp {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcUdp, Error> {
         const TYPICAL_HEADER: usize = 20;
-        let (result, len) = match consumed(bcudp)(buf) {
+        let (result, len) = match consumed(bcudp).parse(&buf[..]) {
             Ok((_, (parsed_buff, result))) => Ok((result, parsed_buff.len())),
             Err(e) => Err(e),
         }?;
@@ -41,7 +41,8 @@ fn bcudp(buf: &[u8]) -> IResult<&[u8], BcUdp> {
                 MAGIC_HEADER_UDP_NEGO | MAGIC_HEADER_UDP_ACK | MAGIC_HEADER_UDP_DATA
             )
         }),
-    )(buf)?;
+    )
+    .parse(buf)?;
 
     match magic {
         MAGIC_HEADER_UDP_NEGO => {
@@ -61,14 +62,15 @@ fn bcudp(buf: &[u8]) -> IResult<&[u8], BcUdp> {
 }
 
 fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
-    let (buf, payload_size) = error_context("DISC: Missing payload size", le_u32)(buf)?;
+    let (buf, payload_size) = error_context("DISC: Missing payload size", le_u32).parse(buf)?;
     let (buf, _unknown_a) = error_context(
         "DISC: Unable to verify UnknowA",
         verify(le_u32, |&x| x == 1),
-    )(buf)?;
-    let (buf, tid) = error_context("DISC: Missing TID", le_u32)(buf)?;
-    let (buf, checksum) = error_context("DISC: Missing checksum", le_u32)(buf)?;
-    let (buf, enc_data_slice) = take(payload_size)(buf)?;
+    )
+    .parse(buf)?;
+    let (buf, tid) = error_context("DISC: Missing TID", le_u32).parse(buf)?;
+    let (buf, checksum) = error_context("DISC: Missing checksum", le_u32).parse(buf)?;
+    let (buf, enc_data_slice) = take(payload_size).parse(buf)?;
 
     let actual_checksum = calc_crc(enc_data_slice);
     assert_eq!(checksum, actual_checksum);
@@ -92,19 +94,20 @@ fn udp_disc(buf: &[u8]) -> IResult<&[u8], UdpDiscovery> {
 }
 
 fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
-    let (buf, connection_id) = error_context("ACK: Missing connect ID", le_i32)(buf)?;
+    let (buf, connection_id) = error_context("ACK: Missing connect ID", le_i32).parse(buf)?;
     let (buf, _unknown_a) =
-        error_context("ACK: Unable to verify UnknowA", verify(le_u32, |&x| x == 0))(buf)?;
+        error_context("ACK: Unable to verify UnknowA", verify(le_u32, |&x| x == 0)).parse(buf)?;
     let (buf, group_id) = error_context(
         "ACK: Unable to verify UnknowB",
         verify(le_u32, |&x| x == 0 || x == 0xffffffff),
-    )(buf)?;
-    let (buf, packet_id) = error_context("Missing packet_id", le_u32)(buf)?; // This is the point at which the camera has contigious
+    )
+    .parse(buf)?;
+    let (buf, packet_id) = error_context("Missing packet_id", le_u32).parse(buf)?; // This is the point at which the camera has contigious
                                                                              // packets to
-    let (buf, maybe_latency) = error_context("ACK: Missing Maybe Latency", le_u32)(buf)?;
-    let (buf, payload_size) = error_context("ACK: Missing payload_size", le_u32)(buf)?;
+    let (buf, maybe_latency) = error_context("ACK: Missing Maybe Latency", le_u32).parse(buf)?;
+    let (buf, payload_size) = error_context("ACK: Missing payload_size", le_u32).parse(buf)?;
     let (buf, payload) = if payload_size > 0 {
-        let (buf, t_payload) = take(payload_size)(buf)?; // It is a binary payload of
+        let (buf, t_payload) = take(payload_size).parse(buf)?; // It is a binary payload of
                                                          // `00 01 01 01 01 00 01`
                                                          // This is a truth map of missing packets
                                                          // since last contigious packet_id up
@@ -125,12 +128,12 @@ fn udp_ack(buf: &[u8]) -> IResult<&[u8], UdpAck> {
 }
 
 fn udp_data(buf: &[u8]) -> IResult<&[u8], UdpData> {
-    let (buf, connection_id) = error_context("DATA: Missing connection_id", le_i32)(buf)?;
+    let (buf, connection_id) = error_context("DATA: Missing connection_id", le_i32).parse(buf)?;
     let (buf, _unknown_a) =
-        error_context("DATA: Unable to verify UnownA", verify(le_u32, |&x| x == 0))(buf)?;
-    let (buf, packet_id) = error_context("DATA: Missing packet_id", le_u32)(buf)?;
-    let (buf, payload_size) = error_context("DATA: Missing payload_size", le_u32)(buf)?;
-    let (buf, payload) = take(payload_size)(buf)?;
+        error_context("DATA: Unable to verify UnownA", verify(le_u32, |&x| x == 0)).parse(buf)?;
+    let (buf, packet_id) = error_context("DATA: Missing packet_id", le_u32).parse(buf)?;
+    let (buf, payload_size) = error_context("DATA: Missing payload_size", le_u32).parse(buf)?;
+    let (buf, payload) = take(payload_size).parse(buf)?;
 
     let data = UdpData {
         connection_id,
@@ -150,6 +153,14 @@ mod tests {
     use env_logger::Env;
     use log::*;
     use std::io::ErrorKind;
+
+    #[test]
+    fn fragmented_udp_waits_for_more_data_without_consuming_input() {
+        crate::assert_fragmented_parse(
+            include_bytes!("samples/udp_data.bin"),
+            BcUdp::deserialize,
+        );
+    }
 
     fn init() {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))

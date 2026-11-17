@@ -7,9 +7,9 @@ edition = "2018"
 license = "AGPL-3.0-or-later"
 
 [dependencies]
-aes = "0.8.4"
+aes = "0.9.4"
 bytes = "1.11.1"
-cfb-mode = "0.8.2"
+cfb-mode = "0.9.1"
 cookie-factory = "0.3.3"
 crc32fast = "1.5.0"
 crossbeam-channel = "0.5.15"
@@ -19,8 +19,9 @@ get_if_addrs = "0.5.3"
 lazy_static = "1.5.0"
 log = "0.4.29"
 md5 = "0.8.0"
-nom = { version = "7.1.3", features = ["alloc"] }
-quick-xml = { version = "0.39.2", features = ["serialize"] }
+nom = { version = "8.0.0", features = ["alloc"] }
+nom-language = "0.1.0"
+quick-xml = { version = "0.42.0", features = ["serialize"] }
 rand = "0.10.0"
 regex = "1.12.3"
 serde = { version = "1.0.228", features = ["derive"] }
