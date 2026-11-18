@@ -28,13 +28,13 @@ All packets start with a **4-byte magic** (uint32 LE). Valid magics:
 |-------------|------------|-------------|--------------------------------|
 | `0x31303031`| "1001"     | Info V1     | Stream info (legacy)           |
 | `0x32303031`| "1002"     | Info V2     | Stream info (current)         |
-| `0x63643030`..`0x63643039` | "cd00".."cd09" | I-frame | H.264/H.265 keyframe  |
-| `0x63643130`..`0x63643139` | "cd10".."cd19" | P-frame | H.264/H.265 delta frame |
-| `0x62773530`| "bw50"     | AAC         | AAC audio                      |
-| `0x62773130`| "bw10"     | ADPCM       | ADPCM audio (DVI-4, 8 kHz)     |
+| `0x63643030`..`0x63643039` | "00dc".."90dc" | I-frame | H.264/H.265 keyframe  |
+| `0x63643130`..`0x63643139` | "01dc".."91dc" | P-frame | H.264/H.265 delta frame |
+| `0x62773530`| "05wb"     | AAC         | AAC audio                      |
+| `0x62773130`| "01wb"     | ADPCM       | ADPCM audio (DVI-4, 8 kHz)     |
 
-- **"cd"** (video): I- and P-frame magics; the low nibble can encode NVR channel (0–9).  
-- **"bw"** (audio): Both audio types use this prefix; it may mean mono / single-channel (e.g. “black & white” for one channel). The Android app uses **"wb"** for audio in a different 7-byte framing (see §7 References).  
+- **"dc"** (video): The suffix in the on-wire ASCII tags; the first digit can encode NVR channel (0–9).
+- **"wb"** (audio): The suffix in the on-wire ASCII tags. No channel interpretation is established here.
 - **No other magics**: The Neolink parser and all observed streams only use the above. There is no other BcMedia 4-byte magic in the codebase or in pcaps. (A separate, non-BcMedia format in the Android app uses 7-byte tags: `dcH26` for video, `wb` for audio; see `notes/ANDROID_REPLAY_DOWNLOAD_FLOW.md`.)
 
 ---
@@ -45,23 +45,23 @@ All packets start with a **4-byte magic** (uint32 LE). Valid magics:
 
 | Offset | Size | Field           | Description                    |
 |--------|------|-----------------|--------------------------------|
-| 0      | 4    | header_size     | Must be 32                     |
+| 0      | 4    | header_size     | Must be 32, including the magic |
 | 4      | 4    | video_width     | Width in pixels                |
 | 8      | 4    | video_height    | Height in pixels               |
 | 12     | 1    | unknown         | Reserved                        |
 | 13     | 1    | fps             | FPS (or index on older cams)   |
-| 14     | 1    | start_year      | Start time (year byte, e.g. 121 = 2021) |
-| 15..20 | 6    | start_month..start_seconds | Start date/time |
-| 21..26 | 6    | end_*           | End date/time                  |
-| 27     | 2    | unknown         | Reserved                        |
+| 14     | 1    | start_year      | UTC year since 1900, e.g. 121 = 2021 |
+| 15..19 | 5    | start_month..start_seconds | Remaining start date/time |
+| 20..25 | 6    | end_year..end_seconds | End date/time, same year encoding |
+| 26     | 2    | unknown         | Reserved                        |
 
-**Total header**: 4 (magic) + 32 = 36 bytes.
+Offsets in this table start **after** the 4-byte magic. **Total packet**: 4 B magic + 28 B remaining fields = **32 bytes**. There is no separate media payload.
 
 ### 3.2 Info V2 (`0x32303031`)
 
-Same layout as Info V1 (header_size 32, width, height, fps, start/end date-time). Total header 36 bytes.
+Same layout as Info V1 (header_size 32, width, height, fps, start/end UTC date-time). Total packet **32 bytes**, including the magic.
 
-### 3.3 I-frame (`cd00`..`cd09`)
+### 3.3 I-frame (`00dc`..`90dc`)
 
 | Offset | Size | Field                  | Description                    |
 |--------|------|------------------------|--------------------------------|
@@ -77,7 +77,7 @@ Same layout as Info V1 (header_size 32, width, height, fps, start/end date-time)
 
 Padding: `pad = (8 - (payload_size % 8)) % 8` bytes of zeros after the payload.
 
-### 3.4 P-frame (`cd10`..`cd19`)
+### 3.4 P-frame (`01dc`..`91dc`)
 
 Same as I-frame but no optional `time` field in practice (additional_header_size often 0):
 
@@ -112,7 +112,7 @@ Sample rate is 8000 Hz. Block size for duration: `block_size = data.len() - 4`; 
 - **Start**: Stream typically begins with **Info V1** or **Info V2**, then I-frames and P-frames (and optionally AAC/ADPCM).
 - **Parsing**: Read 4-byte magic; dispatch to the correct parser; consume header + payload + padding; repeat. If the stream is corrupted, a non-strict decoder may skip bytes until the next known magic.
 - **Video**: I-frame and P-frame `data` are raw NAL units (H.264 or H.265). They may already include Annex B start codes (`0x00 0x00 0x01` or `0x00 0x00 0x00 0x01`); if not, prepend `0x00 0x00 0x00 0x01` for Annex B. FFmpeg can then read `-f h264` or `-f hevc` and mux to MP4.
-- **Receive-only sentinels** (not on wire): Neolink uses `RawReplayChunk` for raw container bytes and `StreamEnd` when the camera signals end of file (response 300/331).
+- **Receive-only sentinels** (not on wire): Neolink uses `RawReplayChunk` for raw container bytes and currently emits `StreamEnd` on response 300/331. **331 is not universally the end of the whole transfer**: the observed Cam Argus 2 ID-143 download continues with another media section and ends with 300.
 
 Reference implementation: `crates/core/src/bcmedia/` (model.rs, de.rs, ser.rs, codex.rs).
 
@@ -122,10 +122,11 @@ Reference implementation: `crates/core/src/bcmedia/` (model.rs, de.rs, ser.rs, c
 
 Replay is carried over Baichuan TCP messages (e.g. MSG 5, MSG 8, or desktop 0x17d):
 
-1. **32-byte replay header**: In the **official app** (Ghidra: BaichuanReplayer::handleBinaryDataResponse, Android 0x0034b22c; Desktop FUN_1801768c0), the first packet is treated as **metadata only** (not written to the stream) **only when** **msg_id == 5**, **response_code == 200**, and **body length == 32**. For **0x17d** the app does *not* skip: it writes that first 32-byte body. Neolink skips the first 32 bytes of the accumulated buffer when it does not start with `ftyp` (so BcMedia/MP4 logic sees the real start); for strict app parity you would skip only when the replay was started with MSG 5. Optional file size may be at +0x10 and +0x18 (uint64 LE) in the 32-byte header.
-2. **Response codes**: **200** = accept (replay start); **300** = end (by-name); **331** = end (by-time); **400** = reject. Streaming data packets may use other response codes; the app only writes when `header.response_code == replayer.expected_response_code` (e.g. Android this+0x1c).
+1. **32-byte replay header**: In the **official app** (Ghidra: BaichuanReplayer::handleBinaryDataResponse, Android 0x0034b22c; Desktop FUN_1801768c0), the first packet is treated as **metadata only** (not written to the stream) **only when** **msg_id == 5**, **response_code == 200**, and **body length == 32**. For **0x17d** the app does *not* skip: it writes that first 32-byte body. Neolink now selects the format before removing any prefix. A 32-byte InfoV1/InfoV2 remains stream metadata. An unknown 32-byte prefix is removed only when the following BcMedia, MP4 or elementary stream is positively recognized. Optional legacy file size may be at +0x10 or +0x18 (uint64 LE); it never limits a BcMedia transfer.
+
+2. **Response codes**: **200** = accepted/data; **300** = final end in the observed ID-143 downloads; **331** can mark a section boundary, followed by more ID-143 media; **400** = rejected. These meanings depend on the operation and camera. Streaming data may use other raw status values: the observed Cam Argus 4 ID-5 replay uses class `0x6af5`, status `0xdaaf`, after its initial InfoV2/200 response.
 3. **Following packets**: Either BcMedia-framed data, raw MP4 chunks, or (E1) **Extension XML + binary** blocks — see `notes/REPLAY_BIN_ANALYSIS.md`. If the first payload after the 32-byte header has `ftyp` at bytes 4–8, the stream is treated as raw MP4; otherwise BcMedia or E1 format.
-4. **End of stream**: Camera sends **300** or **331**. Some cameras never send them; Neolink can stop when received payload size reaches the expected size from the file list or 32-byte header.
+4. **End of stream**: The observed ID-143 downloads finish with **300**, followed by a client ID-144 stop and a 200 confirmation. Treating **331** as a final end truncates the Cam Argus 2 transfer after its first section. Some cameras never send an end code; any size-based fallback must match the transferred format rather than assume that MP4 file size equals BcMedia byte count.
 5. **Decrypt boundary (Ghidra):** Replay binary is decrypted **before** it reaches the replayer. In Android `libBCSDKWrapper.so`, `BaichuanDevice::handleResponseV20` @ 0x002bdc60: (a) decrypts the **extension** (if encrypted) via `BaichuanEncryptor::decrypt`, (b) parses `Net_get_query_from_xml`, (c) decrypts the **body** in place (or only the region given by E1 `encryptPos`/`encryptLen` when present), (d) then calls `handleBinaryDataResponse` or `BCNetSessionQueue::setResponseData`. So BcMedia/MP4/E1 payload formats in docs refer to bytes **after** this decrypt step; on wire they are encrypted (XOR or AES per login). See `notes/baichuan-bcsdk-reverse-engineering.md` (reolink) and `notes/REPLAY_SCHEMA_PLAN.md`.
 
 See `crates/core/src/bc_protocol/replay.rs` and `dissector/PCAP_ANALYSIS.md` for message IDs and reassembly.
@@ -166,13 +167,13 @@ No other well-known open-source projects (GStreamer, VLC demuxers, etc.) were fo
 
 ## 6.4 When does the replay stream end?
 
-We can stop in three ways:
+The receiver uses format-specific completion rules:
 
-1. **Camera end codes** — The camera sends a message with `response_code == 300` (replay by-name) or `331` (download-by-time). The core then emits `BcMedia::StreamEnd` and the app exits with “camera signalled end of file”. Some cameras (e.g. E1) may **not** send 300 before we hit a timeout.
-2. **Size-based** — When we have an expected file size (from the file list or from the 32-byte replay header), the core stops when `total_binary_bytes - 32 >= expected_payload_size` and sends `StreamEnd`. So we do **not** rely only on time if size is known.
-3. **Duration / timeout** — If the app has a duration (e.g. from the file list, “31 s”), it runs a timer. When the timer fires we break with “31s duration reached” and send MSG 7 (replay stop). So in that case we are **timing out**, not necessarily receiving 300 or hitting expected size.
+1. **Camera end codes** — 300 is final. A 331 response with section metadata or a known remaining `FileCount` continues reception; a legacy final 331 still ends the stream.
+2. **Size-based** — A known stored-file or legacy-header size can complete MP4/raw-container reception. BcMedia framing, padding and audio make its transfer size different from stored MP4 size, so this rule does not apply to BcMedia.
+3. **Timeout / explicit duration** — Replay retains its 15-second inactivity fallback, with incomplete-frame validation. ID 143 reports inactivity as an error and retains partial data. `--duration` and Ctrl+C retain a clearly named partial recording; recording duration is not an automatic wall-clock download limit.
 
-So: we **do** know stream end when the camera sends 300/331 or when we receive the expected byte count; otherwise we stop when the duration timer fires.
+ID 143 is stopped with ID 144, including after cancellation or errors. Replay is stopped with ID 7. A named download can retry legacy replay after an ID-143 startup or receive failure, using separate files.
 
 ---
 

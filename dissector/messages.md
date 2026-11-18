@@ -2215,6 +2215,19 @@ Message have zero to two payloads.
 
     Channel_id seems to be set to -106 on failure maybe an internal error code
 
+- 143: `<FileInfoList>` (download by time)
+
+  - Client: XML with `channelId`, `supportSub`, `streamType`, `startTime` and `endTime`. The observed requests contain no recording `name` or `Id` path.
+  - Camera / 200: XML metadata (`sizeL`, `sizeH`, `FileCount`), then BcMedia data in separate messages.
+  - Camera / 331: In the Cam Argus 2 capture, Extension XML + 32-byte section metadata starting with `31 30 20 00`, followed by more ID-143/200 media. This is not InfoV2; no new download request occurs.
+  - Camera / 300: Empty body; final completion in the observed downloads.
+
+- 144: Stop download
+
+  - Client: Empty body after ID-143 completion.
+  - Camera: 200 confirmation with empty body.
+  - This meaning is observed in the Cam Argus 2 and Cam Argus 4 downloads; other uses remain unverified.
+
 - 146: `<StreamInfoList>`
 
   - Client
