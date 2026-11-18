@@ -119,9 +119,13 @@ Encryption is negotiated in the login request.
 #### Status Code
 
 In a request this is set to `00 00`.
-In a reply this is a http style response code.
+In a service reply this is a http style response code (little-endian).
 `c8 00` = 200 OK
 `90 01` = 400 Bad Request
+`2c 01` = 300: final completion in the observed ID-143 downloads.
+`4b 01` = 331: section boundary in the Cam Argus 2 ID-143 download; final completion in some legacy replay flows.
+
+Meaning depends on operation and camera. Opaque binary class/status words are not necessarily service codes; Cam Argus 4 ID-5 media uses class `0x6af5`, status `0xdaaf`.
 
 #### Message class
 
@@ -135,6 +139,8 @@ and header lengths are known.
 - 0x6414: "modern" 24 bytes
 
 - 0x0000: "modern" 24 bytes
+
+- 0x6af5: "modern (opaque replay)" 24 bytes, observed Cam Argus 4 ID-5 media; status word has no established service meaning
 
 #### Payload offset
 
@@ -209,6 +215,24 @@ The binary represents a stream of data that can be interrupted by packet
 boundaries. Clients should create a buffer and pop bytes for processing when
 complete media packets are received. Media packets descriptions can be found in
 the [docs](mediapacket.md)
+
+# Recording download (ID 143)
+
+ID 143 requests a time range. One request can return sections from multiple stored recordings (`FileCount`). ID 144 stops the download.
+
+Observed Cam Argus 2 sequence:
+
+```text
+Client -> Camera: ID 143, 15:04:47-15:04:54
+Camera -> Client: ID 143 / 200, FileCount=2; first section
+Camera -> Client: ID 143 / 331, second-section metadata
+Camera -> Client: ID 143 / 200, second section; no new request
+Camera -> Client: ID 143 / 300, final completion
+Client -> Camera: ID 144
+Camera -> Client: ID 144 / 200
+```
+
+The sections map to overlapping recordings `0120261112150447` (15:04:47-15:04:54) and `0120261112150451` (15:04:51-15:05:06), 12 November 2026, CET. The second recording ID is inferred from its times, not transmitted again. All 21 video frames after 331 duplicate earlier frames; audio identity was not checked.
 
 # Other Function
 

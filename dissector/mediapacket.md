@@ -32,6 +32,10 @@ Each packet can be distinguished with the following magic bytes
 - AAC:  0x30, 0x35, 0x77, 0x62
 - ADPCM: 0x30, 0x31, 0x77, 0x62
 
+Bytes are in stream order. Neolink reads magic as a little-endian `u32`: `30 30 64 63` is ASCII `00dc` and numeric value `0x63643030`.
+
+For I/P frames, the first ASCII digit can encode channel 0-9. The Cam Argus 2 ID-143/331 payload starts with `31 30 20 00`; it is section metadata, not a regular InfoV1/V2 packet.
+
 
 ## Headers
 
