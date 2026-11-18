@@ -36,8 +36,8 @@ provided.
 Images are published to GHCR on every push to `master` and on tags:
 
 ```bash
-docker pull ghcr.io/mutuallyassureddeployment/neolink:dev     # latest master
-docker pull ghcr.io/mutuallyassureddeployment/neolink:latest   # latest tagged release
+docker pull ghcr.io/mhhoeper/neolink:dev      # latest master
+docker pull ghcr.io/mhhoeper/neolink:latest   # latest tagged release
 ```
 
 Run with:
@@ -46,7 +46,7 @@ Run with:
 docker run \
   --network host \
   --volume=$PWD/neolink.toml:/etc/neolink.toml \
-  ghcr.io/mutuallyassureddeployment/neolink
+  ghcr.io/mhhoeper/neolink
 ```
 
 > `--network host` is only needed for local broadcast discovery. If you connect
