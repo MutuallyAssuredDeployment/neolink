@@ -242,8 +242,7 @@ v3.
 
 The original upstream project was created by
 [@thirtythreeforty](https://github.com/thirtythreeforty) and maintained by
-[@QuantumEntangledAndy](https://github.com/QuantumEntangledAndy). If you'd like
-to support the original author's work (note: the upstream repo is currently
-unmaintained):
+[@QuantumEntangledAndy](https://github.com/QuantumEntangledAndy) and [@MutuallyAssuredDeployment](https://github.com/MutuallyAssuredDeployment). If you'd like
+to support my work:
 
 [![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/marc367548)
