@@ -39,9 +39,9 @@ name = "Camera01"
 username = "admin"
 password = "password"
 
-# Connection: use address OR uid (not both)
-address = "192.168.1.10:9000"            # direct IP connection
-uid = "ABCDEF0123456789"                 # UID-based discovery
+# Connection: provide address, uid, or both
+address = "192.168.1.10:9000"            # known IP; TCP is tried first
+uid = "ABCDEF0123456789"                 # required for UDP discovery/connection
 
 # Stream selection
 stream = "both"                          # "mainStream", "subStream", or "both" (default)
@@ -67,23 +67,48 @@ discovery_error_after_retries = false    # If all retries fail, stop discovery (
 
 ## Discovery
 
-When connecting by UID, the camera IP is discovered with these methods. Each
-method implicitly enables all prior methods.
+The `discovery` setting controls UID-based UDP discovery and connection setup.
+The default is `relay`. The modes `local`, `remote`, `map`, and `relay` are
+cumulative: each permits the preceding methods as well. `none` disables them
+all, while `cellular` permits only map and relay.
 
 | Method | How it works | Requirements |
 |---|---|---|
-| `local` | UDP broadcast on local network | Network supports broadcasts |
+| `none` | Disable all UID-based UDP discovery and connection setup | Known address with a reachable Baichuan TCP service |
+| `local` | UDP broadcasts and any supplied camera address; no Reolink servers | UID and local network access |
 | `remote` | Ask Reolink servers for camera IP, connect directly | Route to camera + camera can reach Reolink |
 | `map` | Register our IP with Reolink, camera connects to us | Our IP and Reolink reachable from camera |
-| `relay` | Reolink relays all traffic | Both sides can reach Reolink |
+| `relay` | Permit local, remote, map, and relayed traffic (default) | Both sides can reach Reolink for relay |
 | `cellular` | Alias for map + relay only | For cellular cameras (skips local/remote) |
 
 ```toml
-discovery = "local"    # default; use "cellular" for cellular cameras
+discovery = "relay"    # default; use "cellular" for cellular cameras
 ```
 
-If you know the camera's IP address, set `address` directly and skip discovery
-entirely.
+For local UDP connections without contacting Reolink servers, the UID is enough;
+an IP address is optional:
+
+```toml
+uid = "ABCDEF0123456789"
+discovery = "local"
+```
+
+If `address` is supplied, Neolink first probes the camera's Baichuan TCP service
+(normally port 9000). A successful probe allows a TCP connection. Otherwise,
+Neolink can attempt UDP if a UID and a suitable discovery mode are configured.
+For `local`, the supplied address is tried in addition to the broadcasts;
+specifying an IP address does not disable broadcast discovery.
+
+To disable UID-based UDP discovery and connection setup, use:
+
+```toml
+address = "192.168.1.10:9000"
+discovery = "none"
+```
+
+`none` still performs the TCP probe. It cannot connect to a camera through UDP,
+even when its IP is known. If TCP is unavailable, the connection fails. Ping
+reachability alone does not establish that the TCP service is available.
 
 ## Pause & Idle Disconnect
 
