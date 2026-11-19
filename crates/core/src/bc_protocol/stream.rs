@@ -60,20 +60,15 @@ impl StreamData {
     /// Pull data from the camera's buffer
     /// This returns raw BcMedia packets
     pub async fn get_data(&mut self) -> Result<Result<BcMedia>> {
-        if let Some(handle) = self.handle.as_mut() {
-            if handle.is_finished() {
-                self.abort_handle.cancel();
-                handle.await??;
-                return Err(Error::StreamFinished);
-            }
-        } else {
-            self.abort_handle.cancel();
-            return Err(Error::StreamFinished);
-        }
+        // A fast download can finish while frames and StreamEnd are still queued.
+        // Drain them before joining the producer or reporting StreamFinished.
         match self.rx.recv().await {
             Some(data) => Ok(data),
             None => {
                 self.abort_handle.cancel();
+                if let Some(handle) = self.handle.take() {
+                    handle.await??;
+                }
                 Err(Error::StreamFinished)
             }
         }
@@ -84,7 +79,7 @@ impl StreamData {
     pub async fn shutdown(&mut self) -> Result<()> {
         self.abort_handle.cancel();
         if let Some(handle) = self.handle.take() {
-            let _ = handle.await?;
+            handle.await??;
         }
         Ok(())
     }
@@ -113,7 +108,39 @@ impl Drop for StreamData {
     }
 }
 
-// Second from_parts removed — already defined above
+#[cfg(test)]
+mod stream_data_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn drains_frames_and_end_after_download_producer_finishes() {
+        let (tx, rx) = channel(3);
+        let handle = task::spawn(async move {
+            tx.send(Ok(BcMedia::RawReplayChunk(vec![1, 2, 3]))).await.unwrap();
+            tx.send(Ok(BcMedia::StreamEnd)).await.unwrap();
+            Ok(())
+        });
+        while !handle.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut stream = StreamData::from_parts(handle, rx, CancellationToken::new());
+        assert!(matches!(stream.get_data().await.unwrap().unwrap(),
+            BcMedia::RawReplayChunk(data) if data == vec![1, 2, 3]));
+        assert!(matches!(stream.get_data().await.unwrap().unwrap(), BcMedia::StreamEnd));
+        assert!(matches!(stream.get_data().await, Err(Error::StreamFinished)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_propagates_producer_failure() {
+        let (tx, rx) = channel(1);
+        let handle = task::spawn(async move {
+            drop(tx);
+            Err(Error::TimeoutDisconnected)
+        });
+        let mut stream = StreamData::from_parts(handle, rx, CancellationToken::new());
+        assert!(matches!(stream.shutdown().await, Err(Error::TimeoutDisconnected)));
+    }
+}
 
 impl BcCamera {
     ///

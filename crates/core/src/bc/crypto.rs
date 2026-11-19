@@ -1,5 +1,5 @@
 use aes::{
-    cipher::{AsyncStreamCipher, BlockEncrypt, KeyInit, KeyIvInit},
+    cipher::{Block, BlockCipherEncrypt, KeyInit, KeyIvInit},
     Aes128,
 };
 use cfb_mode::{Decryptor, Encryptor};
@@ -16,13 +16,11 @@ pub fn decrypt_cfb_with_state(
     num: &mut u8,
     ciphertext: &[u8],
 ) -> Vec<u8> {
-    use aes::cipher::generic_array::GenericArray;
-    use aes::cipher::typenum::U16;
     let cipher = Aes128::new_from_slice(key).expect("key length");
     let mut out = Vec::with_capacity(ciphertext.len());
     let mut i = 0;
     while i < ciphertext.len() {
-        let mut block: GenericArray<u8, U16> = GenericArray::clone_from_slice(iv);
+        let mut block = Block::<Aes128>::from(*iv);
         cipher.encrypt_block(&mut block);
         let keystream = block.as_slice();
         let n = (16 - (*num as usize)).min(ciphertext.len() - i);
@@ -126,7 +124,7 @@ impl EncryptionProtocol {
                 // Each packet starts fresh with Master IV and num=0.
                 // We create a new decryptor for each packet to match this behavior.
                 // CFB state is still preserved WITHIN a packet (for multi-block packets).
-                let decryptor = Aes128CfbDec::new(key.as_slice().into(), iv.as_slice().into());
+                let decryptor = Aes128CfbDec::new(key.into(), iv.into());
                 let mut decrypted = buf.to_vec();
                 decryptor.decrypt(&mut decrypted);
                 decrypted
@@ -139,7 +137,7 @@ impl EncryptionProtocol {
     pub fn decrypt_with_iv(&self, packet_iv: &[u8; 16], buf: &[u8]) -> Option<Vec<u8>> {
         match self {
             EncryptionProtocol::Aes { key, .. } | EncryptionProtocol::FullAes { key, .. } => {
-                let decryptor = Aes128CfbDec::new(key.as_slice().into(), packet_iv.as_slice().into());
+                let decryptor = Aes128CfbDec::new(key.into(), packet_iv.into());
                 let mut decrypted = buf.to_vec();
                 decryptor.decrypt(&mut decrypted);
                 Some(decrypted)
@@ -165,7 +163,7 @@ impl EncryptionProtocol {
                 // Each packet starts fresh with Master IV and num=0.
                 // We create a new encryptor for each packet to match this behavior.
                 // CFB state is still preserved WITHIN a packet (for multi-block packets).
-                let encryptor = Aes128CfbEnc::new(key.as_slice().into(), iv.as_slice().into());
+                let encryptor = Aes128CfbEnc::new(key.into(), iv.into());
                 let mut encrypted = buf.to_vec();
                 encryptor.encrypt(&mut encrypted);
                 encrypted
@@ -181,6 +179,44 @@ fn test_xml_crypto() {
 
     let decrypted = EncryptionProtocol::BCEncrypt.decrypt(0, &sample[..]);
     assert_eq!(decrypted, &should_be[..]);
+}
+
+#[test]
+fn test_aes_cfb_nist_vector_and_partial_blocks() {
+    // NIST SP 800-38A, F.3: independent AES-128-CFB128 reference data.
+    let key = [
+        0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6,
+        0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf, 0x4f, 0x3c,
+    ];
+    let iv = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    ];
+    let plaintext = [
+        0x6b, 0xc1, 0xbe, 0xe2, 0x2e, 0x40, 0x9f, 0x96,
+        0xe9, 0x3d, 0x7e, 0x11, 0x73, 0x93, 0x17, 0x2a,
+        0xae, 0x2d, 0x8a, 0x57, 0x1e, 0x03, 0xac, 0x9c,
+        0x9e, 0xb7, 0x6f, 0xac, 0x45, 0xaf, 0x8e, 0x51,
+    ];
+    let ciphertext = [
+        0x3b, 0x3f, 0xd9, 0x2e, 0xb7, 0x2d, 0xad, 0x20,
+        0x33, 0x34, 0x49, 0xf8, 0xe8, 0x3c, 0xfb, 0x4a,
+        0xc8, 0xa6, 0x45, 0x37, 0xa0, 0xb3, 0xa9, 0x3f,
+        0xcd, 0xe3, 0xcd, 0xad, 0x9f, 0x1c, 0xe5, 0x8b,
+    ];
+    for protocol in [
+        EncryptionProtocol::Aes { key, iv },
+        EncryptionProtocol::FullAes { key, iv },
+    ] {
+        for len in [0, 1, 15, 16, 17, 31, 32] {
+            assert_eq!(protocol.encrypt(0, &plaintext[..len]), ciphertext[..len]);
+            assert_eq!(protocol.decrypt(0, &ciphertext[..len]), plaintext[..len]);
+            assert_eq!(
+                EncryptionProtocol::aes(key).decrypt_with_iv(&iv, &ciphertext[..len]),
+                Some(plaintext[..len].to_vec()),
+            );
+        }
+    }
 }
 
 #[test]

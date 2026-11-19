@@ -4,33 +4,23 @@ use bytes::{Buf, BytesMut};
 use log::*;
 use nom::{
     bytes::streaming::take, combinator::*, error::context as error_context, number::streaming::*,
-    sequence::*, Parser,
+    Parser,
 };
 
-type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
+type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
 impl Bc {
     /// Returns Ok(deserialized data, the amount of data consumed)
     /// Can then use this as the amount that should be remove from a buffer
     pub(crate) fn deserialize(context: &BcContext, buf: &mut BytesMut) -> Result<Bc, Error> {
-        let parser = BcParser { context };
-        let (result, amount) = match consumed(parser)(buf) {
+        let parser = |input| bc_msg(context, input);
+        let (result, amount) = match consumed(parser).parse(&buf[..]) {
             Ok((_, (parsed_buff, result))) => Ok((result, parsed_buff.len())),
             Err(e) => Err(Error::from(e)),
         }?;
 
         buf.advance(amount);
         Ok(result)
-    }
-}
-
-struct BcParser<'a> {
-    context: &'a BcContext,
-}
-
-impl<'a> Parser<&'a [u8], Bc, nom::error::VerboseError<&'a [u8]>> for BcParser<'a> {
-    fn parse(&mut self, buf: &'a [u8]) -> IResult<&'a [u8], Bc> {
-        bc_msg(self.context, buf)
     }
 }
 
@@ -59,15 +49,15 @@ fn bc_body<'a>(context: &BcContext, header: &BcHeader, buf: &'a [u8]) -> IResult
     }
 }
 
-fn hex32<'a>() -> impl FnMut(&'a [u8]) -> IResult<&'a [u8], String> {
+fn hex32<'a>() -> impl Parser<&'a [u8], Output = String, Error = crate::NomErrorType<'a>> {
     map_res(take(32usize), |slice: &'a [u8]| {
         String::from_utf8(slice.to_vec())
     })
 }
 
 fn bc_legacy_login_msg(buf: &'_ [u8]) -> IResult<&'_ [u8], LegacyMsg> {
-    let (buf, username) = hex32()(buf)?;
-    let (buf, password) = hex32()(buf)?;
+    let (buf, username) = hex32().parse(buf)?;
+    let (buf, password) = hex32().parse(buf)?;
 
     Ok((buf, LegacyMsg::LoginMsg { username, password }))
 }
@@ -93,9 +83,15 @@ fn bc_modern_msg<'a>(
     // If missing payload_offset treat all as payload
     let ext_len = header.payload_offset.unwrap_or_default();
 
-    let (buf, ext_buf) = take(ext_len)(buf)?;
-    let payload_len = header.body_len - ext_len;
-    let (buf, payload_buf) = take(payload_len)(buf)?;
+    let payload_len = header.body_len.checked_sub(ext_len).ok_or_else(|| {
+        Err::Error(make_error(
+            buf,
+            "Payload offset exceeds body length",
+            ErrorKind::Verify,
+        ))
+    })?;
+    let (buf, ext_buf) = take(ext_len).parse(buf)?;
+    let (buf, payload_buf) = take(payload_len).parse(buf)?;
 
     let decrypted;
     let processed_ext_buf = match context.get_encrypted() {
@@ -176,21 +172,31 @@ fn bc_modern_msg<'a>(
             _ => context.get_encrypted(),
         };
 
-        let processed_payload_buf =
-            encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
         if context.in_bin_mode.borrow().contains(&(header.msg_num)) || in_binary {
             payload = match (context.get_encrypted(), encrypted_len) {
                 (EncryptionProtocol::FullAes { .. }, Some(encrypted_len)) => {
-                    // if if context.debug {
-                    //     log::trace!("Binary: {:X?}", &processed_payload_buf[0..30]);
-                    // }
-                    Some(BcPayloads::Binary(
-                        processed_payload_buf[0..(encrypted_len as usize)].to_vec(),
-                    ))
+                    // encryptLen describes an encrypted prefix, not the total
+                    // payload length. Continuation bytes remain unencrypted.
+                    let encrypted_len = encrypted_len as usize;
+                    if encrypted_len > payload_buf.len() {
+                        return Err(Err::Error(make_error(
+                            buf,
+                            "encryptLen exceeds payload length",
+                            ErrorKind::Verify,
+                        )));
+                    }
+                    let mut data = encryption_protocol.decrypt(
+                        header.channel_id as u32,
+                        &payload_buf[..encrypted_len],
+                    );
+                    data.extend_from_slice(&payload_buf[encrypted_len..]);
+                    Some(BcPayloads::Binary(data))
                 }
                 _ => Some(BcPayloads::Binary(payload_buf.to_vec())),
             };
         } else {
+            let processed_payload_buf =
+                encryption_protocol.decrypt(header.channel_id as u32, payload_buf);
             if context.debug {
                 println!(
                     "Payload Txt: {:?}",
@@ -225,19 +231,21 @@ fn bc_header(buf: &[u8]) -> IResult<&[u8], BcHeader> {
     let (buf, _magic) = error_context(
         "Magic invalid",
         verify(le_u32, |x| *x == MAGIC_HEADER || *x == MAGIC_HEADER_REV),
-    )(buf)?;
-    let (buf, msg_id) = error_context("MsgID missing", le_u32)(buf)?;
-    let (buf, body_len) = error_context("BodyLen missing", le_u32)(buf)?;
-    let (buf, channel_id) = error_context("ChannelID missing", le_u8)(buf)?;
-    let (buf, stream_type) = error_context("StreamType missing", le_u8)(buf)?;
-    let (buf, msg_num) = error_context("MsgNum missing", le_u16)(buf)?;
+    )
+    .parse(buf)?;
+    let (buf, msg_id) = error_context("MsgID missing", le_u32).parse(buf)?;
+    let (buf, body_len) = error_context("BodyLen missing", le_u32).parse(buf)?;
+    let (buf, channel_id) = error_context("ChannelID missing", le_u8).parse(buf)?;
+    let (buf, stream_type) = error_context("StreamType missing", le_u8).parse(buf)?;
+    let (buf, msg_num) = error_context("MsgNum missing", le_u16).parse(buf)?;
     let (buf, (response_code, class)) =
-        error_context("ResponseCode missing", tuple((le_u16, le_u16)))(buf)?;
+        error_context("ResponseCode missing", (le_u16, le_u16)).parse(buf)?;
 
     let (buf, payload_offset) = error_context(
         "Payload Offset is missing",
-        cond(has_payload_offset(class), le_u32),
-    )(buf)?;
+        cond(has_payload_offset(class, msg_id), le_u32),
+    )
+    .parse(buf)?;
 
     Ok((
         buf,
@@ -260,6 +268,68 @@ mod tests {
     use crate::bc::xml::*;
     use assert_matches::assert_matches;
     use env_logger::Env;
+    use std::convert::TryInto;
+
+    #[test]
+    fn fragmented_login_waits_for_more_data_without_consuming_input() {
+        let context = BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt);
+        crate::assert_fragmented_parse(
+            include_bytes!("samples/model_sample_modern_login.bin"),
+            |buf| Bc::deserialize(&context, buf),
+        );
+    }
+
+    #[test]
+    fn replay_opaque_class_keeps_offset_and_unencrypted_tail() {
+        // Captured Argus 4 Pro header layout, neutral key and synthetic media.
+        // Includes an encrypted prefix followed by an unencrypted continuation.
+        let sample = include_bytes!("samples/replay_partial_aes.bin");
+        let context = BcContext::new_with_encryption(
+            EncryptionProtocol::full_aes(*b"test replay key!"),
+        );
+        let mut buf = BytesMut::from(&sample[..]);
+        buf.extend_from_slice(sample);
+        let mut expected = b"01dcH264".to_vec();
+        expected.extend_from_slice(&[0; 24]);
+        expected.extend_from_slice(b"unencrypted continuation");
+        for _ in 0..2 {
+            let msg = Bc::deserialize(&context, &mut buf).unwrap();
+            assert_eq!(msg.meta.class, 0x6afb);
+            assert_eq!(msg.meta.response_code, 0x5070);
+            match msg.body {
+                BcBody::ModernMsg(ModernMsg {
+                    extension: Some(ext), payload: Some(BcPayloads::Binary(data)),
+                }) => {
+                    assert_eq!(ext.encrypt_len, Some(32));
+                    assert_eq!(data, expected);
+                }
+                other => panic!("Expected decrypted binary replay: {:?}", other),
+            }
+        }
+        assert!(buf.is_empty(), "Each 24-byte header must be consumed completely");
+    }
+
+    #[test]
+    fn replay_rejects_encrypt_len_larger_than_payload() {
+        let mut sample = include_bytes!("samples/replay_partial_aes.bin").to_vec();
+        let ext_len = u32::from_le_bytes(sample[20..24].try_into().unwrap()) as usize;
+        sample.truncate(24 + ext_len + 16);
+        sample[8..12].copy_from_slice(&((ext_len + 16) as u32).to_le_bytes());
+        let context = BcContext::new_with_encryption(
+            EncryptionProtocol::full_aes(*b"test replay key!"),
+        );
+        assert!(matches!(Bc::deserialize(&context, &mut BytesMut::from(&sample[..])),
+            Err(Error::NomError(_))));
+    }
+
+    #[test]
+    fn replay_rejects_payload_offset_larger_than_body() {
+        let mut sample = include_bytes!("samples/replay_partial_aes.bin").to_vec();
+        sample[20..24].copy_from_slice(&u32::MAX.to_le_bytes());
+        let context = BcContext::new_with_encryption(EncryptionProtocol::Unencrypted);
+        assert!(matches!(Bc::deserialize(&context, &mut BytesMut::from(&sample[..])),
+            Err(Error::NomError(_))));
+    }
 
     fn init() {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))
@@ -416,7 +486,7 @@ mod tests {
         let sample1 = include_bytes!("samples/modern_video_start1.bin");
         let sample2 = include_bytes!("samples/modern_video_start2.bin");
 
-        let mut context = BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt);
+        let context = BcContext::new_with_encryption(EncryptionProtocol::BCEncrypt);
 
         let msg1 = Bc::deserialize(&context, &mut BytesMut::from(&sample1[..])).unwrap();
         match msg1.body {
@@ -433,7 +503,7 @@ mod tests {
             _ => panic!(),
         }
 
-        context.in_bin_mode.borrow_mut().insert(msg1.meta.msg_num);
+        context.binary_on(msg1.meta.msg_num);
         let msg2 = Bc::deserialize(&context, &mut BytesMut::from(&sample2[..])).unwrap();
         match msg2.body {
             BcBody::ModernMsg(ModernMsg {

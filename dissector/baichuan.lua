@@ -30,11 +30,20 @@ local channel_id =  ProtoField.int8("baichuan.channel_id", "channel_id", base.DE
 local stream_id = ProtoField.int8("baichuan.stream_id", "streamID", base.DEC)
 local unknown = ProtoField.int8("baichuan.unknown", "unknown", base.DEC)
 local msg_handle = ProtoField.int8("baichuan.message_handle", "messageHandle", base.DEC)
-local status_code = ProtoField.int16("baichuan.status_code", "status_code", base.DEC)
+local status_code = ProtoField.uint16("baichuan.status_code", "status_code", base.DEC)
 local message_class = ProtoField.int32("baichuan.msg_class", "messageClass", base.DEC)
 local f_bin_offset = ProtoField.int32("baichuan.bin_offset", "binOffset", base.DEC)
 local username = ProtoField.string("baichuan.username", "username", base.ASCII)
 local password = ProtoField.string("baichuan.password", "password", base.ASCII)
+local replay_file_count = ProtoField.uint32("baichuan.replay.file_count", "Recording file count", base.DEC)
+local replay_event = ProtoField.string("baichuan.replay.event", "Replay event")
+local replay_section_metadata = ProtoField.bytes("baichuan.replay.section_metadata", "Recording section metadata")
+local replay_error = ProtoField.string("baichuan.replay.error", "Replay decode error")
+local replay_media_type = ProtoField.string("baichuan.replay.media_type", "Media prefix")
+local tcp_stream_field = Field.new("tcp.stream")
+local tcp_sequence_field = Field.new("tcp.seq_raw")
+local collect_replay_message
+local replay_transfers, replay_lanes, replay_recent, replay_seen = {}, {}, {}, {}
 
 -- UDP Related content
 local udp_magic = ProtoField.int32("baichuan.udp_magic", "udp_magic", base.DEC)
@@ -66,6 +75,11 @@ bc_protocol.fields = {
   f_bin_offset,
   username,
   password,
+  replay_file_count,
+  replay_event,
+  replay_section_metadata,
+  replay_error,
+  replay_media_type,
   udp_magic,
   udp_type,
   udp_message_id,
@@ -167,7 +181,7 @@ local message_types = {
   [141]="<Email> (test)",
   [142]="<DayRecords>",  -- SO: 0x8e BaichuanReplayer 0x836 handler
   [143]="<FileInfoList> (download video)",  -- SO: 0x8f BaichuanDownloader
-  [144]="<FileInfoList?>",  -- PCAP: seen in capture; notes: HddInit 0x90
+  [144]="Stop download (ID 143)",  -- Observed Cam Argus 2/Cam Argus 4 downloads; other uses unverified.
   [145]="<ChannelInfoList>",  -- SO: 0x91 → device report path
   [146]="<StreamInfoList>",
   [151]="<AbilityInfo>",
@@ -286,6 +300,7 @@ local message_classes = {
   [0x6414]="modern",
   [0x6482]="modern (file download)",
   [0x0000]="modern",
+  [0x6af5]="modern (opaque replay)", -- Cam Argus 4 ID-5 media; status word is not a service code.
 }
 
 local header_lengths = {
@@ -294,6 +309,7 @@ local header_lengths = {
   [0x6414]=24,
   [0x6482]=24,
   [0x0000]=24,
+  [0x6af5]=24,
 }
 
 -----
@@ -375,7 +391,8 @@ local function md5_binary(msg)
   local function word2bytes(w)
     return band(w, 0xFF), band(rshift(w, 8), 0xFF), band(rshift(w, 16), 0xFF), band(rshift(w, 24), 0xFF)
   end
-  return string.char(word2bytes(A), word2bytes(B), word2bytes(C), word2bytes(D))
+  return string.char(word2bytes(A)) .. string.char(word2bytes(B))
+    .. string.char(word2bytes(C)) .. string.char(word2bytes(D))
 end
 
 local gcrypt
@@ -400,16 +417,19 @@ local function derive_aes_key(pinfo)
 end
 
 local function aes_decrypt(data, pinfo)
+  if not gcrypt and not (GcryptCipher and GCRY_CIPHER_AES128 and GCRY_CIPHER_MODE_CFB) then
+    return ByteArray.new("", true)
+  end
   local key = derive_aes_key(pinfo)
   local iv = "0123456789abcdef"
   local ciphertext = data
 
   -- Prefer Wireshark's built-in GcryptCipher (no luagcrypt needed)
-  if GcryptCipher and GCRY_CIPHER_AES256 and GCRY_CIPHER_MODE_CFB then
+  if GcryptCipher and GCRY_CIPHER_AES128 and GCRY_CIPHER_MODE_CFB then
     local ok, decrypted = pcall(function()
-      local cipher = GcryptCipher.open(GCRY_CIPHER_AES256, GCRY_CIPHER_MODE_CFB, 0)
-      cipher:setkey(ByteArray.new(key))
-      cipher:setiv(ByteArray.new(iv))
+      local cipher = GcryptCipher.open(GCRY_CIPHER_AES128, GCRY_CIPHER_MODE_CFB, 0)
+      cipher:setkey(ByteArray.new(key, true))
+      cipher:setiv(ByteArray.new(iv, true))
       return cipher:decrypt(nil, ByteArray.new(ciphertext, true))
     end)
     if ok and decrypted and decrypted:len() > 0 then
@@ -419,11 +439,13 @@ local function aes_decrypt(data, pinfo)
 
   -- Fallback: luagcrypt (optional, build from source)
   if gcrypt then
-    local cipher = gcrypt.Cipher(gcrypt.CIPHER_AES256, gcrypt.CIPHER_MODE_CFB)
-    cipher:setkey(key)
-    cipher:setiv(iv)
-    local decrypted = cipher:decrypt(ciphertext)
-    return ByteArray.new(decrypted, true)
+    local ok, decrypted = pcall(function()
+      local cipher = gcrypt.Cipher(gcrypt.CIPHER_AES128, gcrypt.CIPHER_MODE_CFB)
+      cipher:setkey(key)
+      cipher:setiv(iv)
+      return cipher:decrypt(ciphertext)
+    end)
+    if ok and decrypted then return ByteArray.new(decrypted, true) end
   end
 
   return ByteArray.new("", true)
@@ -512,7 +534,8 @@ local function process_header(buffer, headers_tree)
   header:add_le(message_class, buffer(18, 2)):append_text(" (" .. header_data.class .. ")")
 
   if header_data.header_len == 24 then
-    header:add_le(status_code, buffer(16, 2))
+    local status = header:add_le(status_code, buffer(16, 2))
+    if header_data.msg_cls == 0x6af5 then status:append_text(" (opaque media word; not a service code)") end
     header:add_le(f_bin_offset, buffer(20, 4))
   else
     header:add_le(encrypt_xml, buffer(16, 1))
@@ -765,12 +788,13 @@ local function process_udp_header(buffer, headers_tree)
   return header_data.length
 end
 
-local function process_bc_message(buffer, pinfo, tree)
+local function process_bc_message(buffer, pinfo, tree, reassembly_key)
   pinfo.cols.protocol = bc_protocol.name
 
   local sub_buffer = buffer
   local table_msg_type_str = {}
   local table_msg_type = {}
+  local message_offset = 0
 
   local continue_loop = true
   while ( continue_loop )
@@ -792,9 +816,11 @@ local function process_bc_message(buffer, pinfo, tree)
       local bc_subtree = tree:add(bc_protocol, sub_buffer(0, full_body_len),
         "Baichuan IP Camera Protocol, " .. header.msg_type_str .. ":" .. header.msg_type .. " message")
       process_header(sub_buffer, bc_subtree)
+      local replay_handled = collect_replay_message(header, sub_buffer, pinfo, bc_subtree,
+        reassembly_key, message_offset)
       if header.header_len < sub_buffer:len() then
         local body_buffer = sub_buffer(header.header_len,nil)
-        process_body(header, body_buffer, bc_subtree, pinfo)
+        if not replay_handled then process_body(header, body_buffer, bc_subtree, pinfo) end
 
         remaining = body_buffer:len() - header.msg_len
       end
@@ -804,6 +830,7 @@ local function process_bc_message(buffer, pinfo, tree)
         continue_loop = false
       else
         sub_buffer = sub_buffer(full_body_len, nil)
+        message_offset = message_offset + full_body_len
       end
     else
       return
@@ -874,7 +901,8 @@ end
 
 local function udp_reassemple(udp_header, subbuffer, more, pinfo, tree)
   -- Cache udp message for later lookup
-  local con_id = udp_header.connection_id
+  local con_id = tostring(pinfo.src) .. ":" .. pinfo.src_port .. ">" .. tostring(pinfo.dst)
+    .. ":" .. pinfo.dst_port .. ":" .. udp_header.connection_id
   if udp_fragments[con_id] == nil then
     udp_fragments[con_id] = {}
   end
@@ -904,8 +932,7 @@ local function udp_reassemple(udp_header, subbuffer, more, pinfo, tree)
     if needed == "DONE" then
       if start_fragment.message_id == udp_header.packet_count then
         local rtvb = start_fragment.buffer:tvb("UDP Reassembly")
-        process_bc_message(rtvb, pinfo, tree)
-        parse_and_collect_replay(rtvb, pinfo)
+        process_bc_message(rtvb, pinfo, tree, con_id .. ":" .. start_idx)
       end
     elseif needed == "+1" then
       -- Cannot handle in UDP...
@@ -933,8 +960,7 @@ local function udp_reassemple(udp_header, subbuffer, more, pinfo, tree)
       if reassembled:len() >= target_len then
         start_fragment.result = "DONE"
         local rtvb = reassembled:tvb("Reassembled UDP")
-        process_bc_message(rtvb, pinfo, tree)
-        parse_and_collect_replay(rtvb, pinfo)
+        process_bc_message(rtvb, pinfo, tree, con_id .. ":" .. start_idx)
       end
     end
   end
@@ -942,7 +968,8 @@ end
 
 function bc_protocol.init ()
    udp_fragments = {}
-   _replay_packets = {}
+   replay_transfers, replay_lanes, replay_recent, replay_seen = {}, {}, {}, {}
+   _G.nonce = {}
 end
 
 function bc_protocol.dissector(buffer, pinfo, tree)
@@ -981,7 +1008,6 @@ function bc_protocol.dissector(buffer, pinfo, tree)
     if pinfo.can_desegment == 1 then -- TCP can use the desegment method
       if more == "DONE" then
         process_bc_message(subbuffer, pinfo, tree)
-        parse_and_collect_replay(subbuffer, pinfo)
         return
       elseif more == "+1" then
         pinfo.desegment_len = DESEGMENT_ONE_MORE_SEGMENT
@@ -1059,54 +1085,175 @@ local function heuristic_checker_tcp(buffer, pinfo, tree)
 end
 
 -----
--- Replay stream export: collect replay binary (msg 5/8/381) and export to file.
+-- Replay/download export. Recording sections stay separate to preserve overlaps.
 -----
-local REPLAY_MSG_IDS = { [5]=true, [8]=true, [381]=true }
-local REPLAY_END_STATUS = { [300]=true, [331]=true }
-local _replay_packets = {}  -- list of {pinfo, status, payload} in packet order
+local REPLAY_MSG_IDS = { [5]=true, [8]=true, [143]=true, [381]=true }
 
-function parse_and_collect_replay(tvb, pinfo)
-  if tvb:len() < 20 then return end
-  local offset = 0
-  while offset + 20 <= tvb:len() do
-    local sub = tvb(offset, nil)
-    local header_len = get_header_len(sub(0, nil))
-    if header_len < 0 or offset + header_len > tvb:len() then break end
-    local header = get_header(sub(0, nil))
-    local full_len = header.header_len + header.msg_len
-    if offset + full_len > tvb:len() then break end
-    if REPLAY_MSG_IDS[header.msg_type] and header.status_code and (header.status_code == 200 or REPLAY_END_STATUS[header.status_code]) then
-      if header.bin_offset and header.msg_len > header.bin_offset then
-        local bin_len = header.msg_len - header.bin_offset
-        local payload = sub(header.header_len + header.bin_offset, bin_len):bytes():raw()
-        table.insert(_replay_packets, { num = pinfo.number, status = header.status_code, payload = payload })
+local function replay_connection(pinfo)
+  local src = tostring(pinfo.src) .. ":" .. pinfo.src_port
+  local dst = tostring(pinfo.dst) .. ":" .. pinfo.dst_port
+  if src > dst then src, dst = dst, src end
+  local stream = tcp_stream_field()
+  return (stream and ("tcp:" .. tostring(stream)) or "udp") .. ":" .. src .. "|" .. dst
+end
+
+local function replay_xml(raw, header, pinfo)
+  if #raw < 5 then return nil end
+  if raw:sub(1, 5) == "<?xml" then return raw end
+  local probe = raw:sub(1, 5)
+  if xml_decrypt(ByteArray.new(probe, true), header.enc_offset):raw() == "<?xml" then
+    return xml_decrypt(ByteArray.new(raw, true), header.enc_offset):raw()
+  end
+  if aes_decrypt(probe, pinfo):raw() == "<?xml" then return aes_decrypt(raw, pinfo):raw() end
+end
+
+local function replay_media_prefix(raw)
+  local magic = raw:sub(1, 4)
+  if magic == "1001" then return "InfoV1" end
+  if magic == "1002" then return "InfoV2" end
+  if magic:match("^[0-9]0dc$") then return "I Frame" end
+  if magic:match("^[0-9]1dc$") then return "P Frame" end
+  if magic == "05wb" then return "AAC" end
+  if magic == "01wb" then return "ADPCM" end
+  if #raw >= 8 and raw:sub(5, 8):match("^ftyp$") then return "MP4" end
+  if raw:sub(1, 3) == "\0\0\1" or raw:sub(1, 4) == "\0\0\0\1" then return "Annex B" end
+end
+
+local function replay_payload(header, buffer, pinfo)
+  local offset = header.bin_offset or 0
+  if offset > header.msg_len then return { error = "Payload offset exceeds body length" } end
+  local extension
+  if offset > 0 then
+    extension = replay_xml(buffer(header.header_len, offset):raw(), header, pinfo)
+    if not extension then return { error = "Extension XML could not be decoded" } end
+  end
+  local raw = buffer(header.header_len + offset, header.msg_len - offset):raw()
+  -- Binary data can carry opaque class/status words. Do not probe encrypted media as XML.
+  local binary = extension and (extension:match("<binaryData>%s*1%s*</binaryData>")
+    or extension:match("<binary>%s*1%s*</binary>"))
+  local xml = not binary and not replay_media_prefix(raw) and replay_xml(raw, header, pinfo) or nil
+  if xml then return { xml = xml, extension = extension } end
+  local encrypted_len = extension and extension:match("<encryptLen>%s*(%d+)%s*</encryptLen>")
+  if encrypted_len then
+    local pos = tonumber(extension:match("<encryptPos>%s*(%d+)%s*</encryptPos>")) or 0
+    local len = tonumber(encrypted_len)
+    if pos + len > #raw then return { error = "Encrypted region exceeds payload length" } end
+    if len > 0 then
+      local decoded = aes_decrypt(raw:sub(pos + 1, pos + len), pinfo):raw()
+      if #decoded ~= len then return { error = "AES media decryption unavailable" } end
+      raw = raw:sub(1, pos) .. decoded .. raw:sub(pos + len + 1)
+    end
+  end
+  return { payload = raw, extension = extension }
+end
+
+local function new_replay_transfer(lane, prefix, pinfo, started)
+  local state = { sections = { { chunks = {} } }, file_count = 0, section = 1,
+    started = started, frame = pinfo.number, order = #replay_transfers + 1 }
+  replay_transfers[#replay_transfers + 1] = state
+  replay_lanes[lane], replay_recent[prefix] = state, state
+  return state
+end
+
+collect_replay_message = function(header, buffer, pinfo, tree, reassembly_key, message_offset)
+  if not REPLAY_MSG_IDS[header.msg_type] and header.msg_type ~= 144 then return false end
+  local connection = replay_connection(pinfo)
+  local sequence = tcp_sequence_field()
+  local direction = tostring(pinfo.src) .. ":" .. pinfo.src_port
+  local key = (reassembly_key or (connection .. ":" .. direction .. ":" .. tostring(sequence or pinfo.number)))
+    .. ":" .. message_offset
+  local event = replay_seen[key]
+  if not event then
+    local decoded = replay_payload(header, buffer, pinfo)
+    event = decoded
+    local prefix = connection .. ":" .. (header.msg_type == 144 and 143 or header.msg_type)
+      .. ":" .. header.channel_id
+    local lane = prefix .. ":" .. header.msg_handle
+    local state = replay_lanes[lane]
+    if header.msg_cls == 0x6af5 or header.msg_type == 144 then state = replay_recent[prefix] end
+    local raw = decoded.payload or ""
+    local metadata = #raw == 32 and raw:sub(1, 4) == "10 \0"
+    -- Only recognized service classes or section metadata give status words their usual meaning.
+    local service = header.msg_cls == 0 or header.msg_cls == 0x6414 or header.msg_cls == 0x6514
+      or header.msg_cls == 0x6614 or header.msg_cls == 0x6482 or metadata
+    if header.msg_type == 144 then
+      event.label = "Stop download (observed ID-143 flow)"
+      if header.status_code == 0 and state then state.ended = true end
+    elseif service and header.status_code == 0 then
+      state = new_replay_transfer(lane, prefix, pinfo, true)
+      event.label = "Start replay/download"
+    else
+      if not state or state.ended then state = new_replay_transfer(lane, prefix, pinfo, false) end
+      local section = state.sections[state.section]
+      if decoded.xml then
+        for count in decoded.xml:gmatch("<FileCount>%s*(%d+)%s*</FileCount>") do
+          state.file_count = math.max(state.file_count, tonumber(count))
+        end
+        if state.file_count > 0 then event.file_count = state.file_count end
+      end
+      if decoded.error then section.error = decoded.error end
+      if service and header.status_code == 300 then
+        if #raw > 0 then section.chunks[#section.chunks + 1] = raw end
+        section.complete, state.ended = true, true
+        event.label = "Final completion (300)"
+      elseif service and header.status_code == 331 then
+        if not metadata and #raw > 0 then section.chunks[#section.chunks + 1] = raw end
+        if metadata or state.section < state.file_count then
+          section.complete = true
+          state.section = state.section + 1
+          state.sections[state.section] = { chunks = {} }
+          event.label = "Recording section boundary (331); transfer continues"
+          if metadata then event.metadata = raw end
+        else
+          section.complete, state.ended = true, true
+          event.label = "Legacy final completion (331)"
+        end
+      elseif service and (header.status_code == 400 or header.status_code == 405) then
+        state.ended = true
+        event.label = "Replay/download rejected"
+      else
+        event.label = decoded.xml and "Replay/download metadata" or "Replay/download media"
+        if #raw > 0 then section.chunks[#section.chunks + 1] = raw end
       end
     end
-    offset = offset + full_len
+    replay_seen[key] = event
   end
+  tree:add(replay_event, event.label):set_generated()
+  if event.file_count then tree:add(replay_file_count, event.file_count):set_generated() end
+  if event.error then
+    tree:add(replay_error, event.error):set_generated()
+    if header.msg_len > 0 then tree:add(buffer(header.header_len, header.msg_len), "Undecoded replay body") end
+  end
+  for _, xml in ipairs({ event.extension or "", event.xml or "" }) do
+    if #xml > 0 then
+      local tvb = ByteArray.new(xml, true):tvb("Decoded replay XML")
+      Dissector.get("xml"):call(tvb, pinfo, tree)
+    end
+  end
+  if event.payload and #event.payload > 0 then
+    local tvb = ByteArray.new(event.payload, true):tvb("Replay binary payload")
+    tree:add(tvb(), "Replay binary payload")
+    if event.metadata then tree:add(replay_section_metadata, tvb()) end
+    local media = replay_media_prefix(event.payload)
+    if media then tree:add(replay_media_type, media):set_generated() end
+  end
+  return true
 end
 
 bc_protocol.prefs.replay_export_dir = Pref.string("Replay export directory", "",
   "Directory path to save exported replay streams (replay_1.bin, replay_2.bin). Empty = current directory.")
 
-local function reassemble_replay_stream(packets)
-  table.sort(packets, function(a,b) return a.num < b.num end)
-  local out = {}
-  local skip_first_32 = true
-  for _, p in ipairs(packets) do
-    if skip_first_32 and #p.payload == 32 then
-      skip_first_32 = false
-    else
-      skip_first_32 = false
-      out[#out + 1] = p.payload
-    end
-    if REPLAY_END_STATUS[p.status] then break end
+local function reassemble_replay_stream(section)
+  local raw = table.concat(section.chunks)
+  -- Keep InfoV1/V2. Strip an unknown prefix only after recognizing the stream at +32.
+  if not replay_media_prefix(raw) and #raw >= 40 and replay_media_prefix(raw:sub(33)) then
+    raw = raw:sub(33)
   end
-  return table.concat(out, "")
+  return raw
 end
 
 local function export_replay_streams()
-  if #_replay_packets == 0 then
+  if #replay_transfers == 0 then
     if gui and gui.message_box then
       gui.message_box("No replay packets found in this capture.", "Export", "ok")
     end
@@ -1115,34 +1262,35 @@ local function export_replay_streams()
   local dir = bc_protocol.prefs.replay_export_dir
   if dir and dir ~= "" and not (dir:match("/$")) then dir = dir .. "/" end
   dir = dir or ""
-  -- Split into streams: each stream ends at status 300/331 or at end of list
-  local streams = {}
-  local current = {}
-  for _, p in ipairs(_replay_packets) do
-    current[#current + 1] = p
-    if REPLAY_END_STATUS[p.status] then
-      streams[#streams + 1] = current
-      current = {}
-    end
-  end
-  if #current > 0 then streams[#streams + 1] = current end
-  local written = 0
-  for i, stream_packets in ipairs(streams) do
-    local raw = reassemble_replay_stream(stream_packets)
-    if #raw > 0 then
-      local ext = "bin"
-      if raw:sub(5,8) == "ftyp" then ext = "mp4" end
-      local fname = dir .. "replay_" .. i .. "." .. ext
-      local f = io.open(fname, "wb")
-      if f then
-        f:write(raw)
-        f:close()
-        written = written + 1
+  table.sort(replay_transfers, function(a, b)
+    return a.frame < b.frame or (a.frame == b.frame and a.order < b.order)
+  end)
+  local written, skipped = 0, 0
+  for i, transfer in ipairs(replay_transfers) do
+    for j, section in ipairs(transfer.sections) do
+      local raw = reassemble_replay_stream(section)
+      if section.error then
+        skipped = skipped + 1
+      elseif #raw > 0 then
+        local ext = "bin"
+        if raw:sub(5,8) == "ftyp" then ext = "mp4" end
+        local suffix = #transfer.sections > 1 and ("_section_" .. j) or ""
+        if not section.complete or not transfer.started then suffix = suffix .. "_partial" end
+        local fname = dir .. "replay_" .. i .. suffix .. "." .. ext
+        local f = io.open(fname, "wb")
+        if f then
+          f:write(raw)
+          f:close()
+          written = written + 1
+        else
+          skipped = skipped + 1
+        end
       end
     end
   end
-  if gui and gui.message_box and written > 0 then
-    gui.message_box("Exported " .. written .. " replay stream(s) to " .. (dir ~= "" and dir or "(current directory)"), "Export", "ok")
+  if gui and gui.message_box then
+    gui.message_box("Exported " .. written .. " recording section(s); skipped " .. skipped
+      .. " undecodable/unwritable section(s). Directory: " .. (dir ~= "" and dir or "(current directory)"), "Export", "ok")
   end
 end
 

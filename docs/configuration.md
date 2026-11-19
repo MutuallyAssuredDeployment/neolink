@@ -40,25 +40,29 @@ username = "admin"
 password = "password"
 
 # Connection: provide address, uid, or both
-address = "192.168.1.10:9000"    # known IP; TCP is tried first
-uid = "ABCDEF0123456789"         # required for UDP discovery/connection
+address = "192.168.1.10:9000"            # known IP; TCP is tried first
+uid = "ABCDEF0123456789"                 # required for UDP discovery/connection
 
 # Stream selection
-stream = "both"                  # "mainStream", "subStream", or "both" (default)
-permitted_users = ["me"]         # restrict to specific users (default: all)
-enabled = true                   # disable without removing from config
+stream = "both"                          # "mainStream", "subStream", or "both" (default)
+permitted_users = ["me"]                 # restrict to specific users (default: all)
+enabled = true                           # disable without removing from config
 
 # Audio & latency
-enable_audio = true              # set false to save CPU (default: true)
-enable_low_latency = false       # reduce stream delay (default: false)
+enable_audio = true                      # set false to save CPU (default: true)
+enable_low_latency = false               # reduce stream delay (default: false)
 
 # Diagnostics
-debug = false                    # dump raw XML from camera
-print_format = "None"            # "None", "Human", or "Xml" for status messages
-update_time = false              # force camera clock sync on connect (uses local wall-clock time)
+debug = false                            # dump raw XML from camera
+print_format = "None"                    # "None", "Human", or "Xml" for status messages
+update_time = false                      # force camera clock sync on connect
 
 # NVR channel (for multi-camera NVRs)
-channel_id = 0                   # 0-indexed camera on NVR
+channel_id = 0                           # 0-indexed camera on NVR
+
+# Keep connection
+max_discovery_retries = 10               # How many discovery retries
+discovery_error_after_retries = false    # If all retries fail, stop discovery (default: false)
 ```
 
 ## Discovery
