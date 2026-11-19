@@ -246,4 +246,5 @@ The original upstream project was created by
 to support the original author's work (note: the upstream repo is currently
 unmaintained):
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/G2G5HOYIZ)
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/Ko-fi.com/marc367548
+)
