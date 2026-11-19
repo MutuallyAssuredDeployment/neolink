@@ -70,6 +70,7 @@ address = "koty.lan:9000"
 # This include relaying via reolink servers
 # This variable `discovery` controls the method of UID discovery
 # - Possible values
+# "none" # Disable UID-based UDP discovery and connection setup; requires a known IP and reachable Baichuan TCP service
 # "relay" # Any means including connecting and transmitting through reolink
 # "map" # Register our local ip address with reolink and ask the camera to connect to us but don't relay data through reolink
 # "remote" # Register our local ip address with reolink but only permit same network connections (useful if broadcast is not possible)

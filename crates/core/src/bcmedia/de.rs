@@ -1,9 +1,9 @@
 use super::model::*;
 use crate::Error;
 use bytes::{Buf, BytesMut};
-use nom::{bytes::streaming::take, combinator::*, error::context, number::streaming::*};
+use nom::{bytes::streaming::take, combinator::*, error::context, number::streaming::*, Parser};
 
-type IResult<I, O, E = nom::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
+type IResult<I, O, E = nom_language::error::VerboseError<I>> = Result<(I, O), nom::Err<E>>;
 
 // PAD_SIZE: Media packets use 8 byte padding
 const PAD_SIZE: u32 = 8;
@@ -37,7 +37,7 @@ pub(crate) fn find_next_bcmedia_magic(buf: &[u8]) -> Option<usize> {
 
 impl BcMedia {
     pub(crate) fn deserialize(buf: &mut BytesMut) -> Result<BcMedia, Error> {
-        let (result, len) = match consumed(bcmedia)(buf) {
+        let (result, len) = match consumed(bcmedia).parse(&buf[..]) {
             Ok((_, (parsed_buff, result))) => Ok((result, parsed_buff.len())),
             Err(e) => Err(e),
         }?;
@@ -60,7 +60,8 @@ fn bcmedia(buf: &[u8]) -> IResult<&[u8], BcMedia> {
                     | MAGIC_HEADER_BCMEDIA_ADPCM
             )
         }),
-    )(buf)?;
+    )
+    .parse(buf)?;
 
     match magic {
         MAGIC_HEADER_BCMEDIA_INFO_V1 => {
@@ -95,7 +96,8 @@ fn bcmedia_info_v1(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV1> {
     let (buf, _header_size) = context(
         "Header size mismatch in BCMedia InfoV1",
         verify(le_u32, |x| *x == 32),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, video_width) = le_u32(buf)?;
     let (buf, video_height) = le_u32(buf)?;
     let (buf, _unknown) = le_u8(buf)?;
@@ -141,7 +143,8 @@ fn bcmedia_info_v2(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV2> {
     let (buf, _header_size) = context(
         "Failed to match headersize in BCMedia Info V2",
         verify(le_u32, |x| *x == 32),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, video_width) = le_u32(buf)?;
     let (buf, video_height) = le_u32(buf)?;
     let (buf, _unknown) = le_u8(buf)?;
@@ -186,14 +189,16 @@ fn bcmedia_info_v2(buf: &[u8]) -> IResult<&[u8], BcMediaInfoV2> {
 fn take4(buf: &[u8]) -> IResult<&[u8], &str> {
     map_res(nom::bytes::streaming::take(4usize), |r| {
         std::str::from_utf8(r)
-    })(buf)
+    })
+    .parse(buf)
 }
 
 fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
     let (buf, video_type_str) = context(
         "Video Type is unrecognised in IFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, payload_size) = le_u32(buf)?;
     let (buf, additional_header_size) = le_u32(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
@@ -206,18 +211,18 @@ fn bcmedia_iframe(buf: &[u8]) -> IResult<&[u8], BcMediaIframe> {
     };
     let (buf, _unknown_remained) = if additional_header_size > 4 {
         let remainder = additional_header_size - 4;
-        let (buf, unknown_remained) = take(remainder)(buf)?;
+        let (buf, unknown_remained) = take(remainder).parse(buf)?;
         (buf, Some(unknown_remained))
     } else {
         (buf, None)
     };
 
-    let (buf, data_slice) = take(payload_size)(buf)?;
+    let (buf, data_slice) = take(payload_size).parse(buf)?;
     let pad_size = match payload_size % PAD_SIZE {
         0 => 0,
         n => PAD_SIZE - n,
     };
-    let (buf, _padding) = take(pad_size)(buf)?;
+    let (buf, _padding) = take(pad_size).parse(buf)?;
     assert_eq!(payload_size as usize, data_slice.len());
 
     let video_type = match video_type_str {
@@ -242,18 +247,19 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
     let (buf, video_type_str) = context(
         "Video Type is unrecognised in PFrame",
         verify(take4, |x| matches!(x, "H264" | "H265")),
-    )(buf)?;
+    )
+    .parse(buf)?;
     let (buf, payload_size) = le_u32(buf)?;
     let (buf, additional_header_size) = le_u32(buf)?;
     let (buf, microseconds) = le_u32(buf)?;
     let (buf, _unknown_b) = le_u32(buf)?;
-    let (buf, _additional_header) = take(additional_header_size)(buf)?;
-    let (buf, data_slice) = take(payload_size)(buf)?;
+    let (buf, _additional_header) = take(additional_header_size).parse(buf)?;
+    let (buf, data_slice) = take(payload_size).parse(buf)?;
     let pad_size = match payload_size % PAD_SIZE {
         0 => 0,
         n => PAD_SIZE - n,
     };
-    let (buf, _padding) = take(pad_size)(buf)?;
+    let (buf, _padding) = take(pad_size).parse(buf)?;
     assert_eq!(payload_size as usize, data_slice.len());
 
     let video_type = match video_type_str {
@@ -276,12 +282,12 @@ fn bcmedia_pframe(buf: &[u8]) -> IResult<&[u8], BcMediaPframe> {
 fn bcmedia_aac(buf: &[u8]) -> IResult<&[u8], BcMediaAac> {
     let (buf, payload_size) = le_u16(buf)?;
     let (buf, _payload_size_b) = le_u16(buf)?;
-    let (buf, data_slice) = take(payload_size)(buf)?;
+    let (buf, data_slice) = take(payload_size).parse(buf)?;
     let pad_size = match payload_size as u32 % PAD_SIZE {
         0 => 0,
         n => PAD_SIZE - n,
     };
-    let (buf, _padding) = take(pad_size)(buf)?;
+    let (buf, _padding) = take(pad_size).parse(buf)?;
 
     Ok((
         buf,
@@ -300,17 +306,18 @@ fn bcmedia_adpcm(buf: &[u8]) -> IResult<&[u8], BcMediaAdpcm> {
     let (buf, _magic) = context(
         "ADPCM data magic value is invalid",
         verify(le_u16, |x| *x == MAGIC_HEADER_BCMEDIA_ADPCM_DATA),
-    )(buf)?;
+    )
+    .parse(buf)?;
     // On some camera this value is just 2
     // On other cameras is half the block size without the header
     let (buf, _half_block_size) = le_u16(buf)?;
     let block_size = payload_size - SUB_HEADER_SIZE;
-    let (buf, data_slice) = take(block_size)(buf)?;
+    let (buf, data_slice) = take(block_size).parse(buf)?;
     let pad_size = match payload_size as u32 % PAD_SIZE {
         0 => 0,
         n => PAD_SIZE - n,
     };
-    let (buf, _padding) = take(pad_size)(buf)?;
+    let (buf, _padding) = take(pad_size).parse(buf)?;
 
     Ok((
         buf,
@@ -330,6 +337,14 @@ mod tests {
     use env_logger::Env;
     use log::*;
     use std::io::ErrorKind;
+
+    #[test]
+    fn fragmented_media_waits_for_more_data_without_consuming_input() {
+        crate::assert_fragmented_parse(
+            include_bytes!("samples/info_v1.raw"),
+            BcMedia::deserialize,
+        );
+    }
 
     fn init() {
         let _ = env_logger::Builder::from_env(Env::default().default_filter_or("info"))

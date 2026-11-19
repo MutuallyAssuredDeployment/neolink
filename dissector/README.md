@@ -4,11 +4,24 @@ The dissector can be used with `wireshark` and `tshark`. It also supports **expo
 
 ## Exporting replay video from a pcap
 
-1. Open your pcap in Wireshark (with the Baichuan dissector installed). Replay packets (message IDs 5, 8, 381) are collected automatically during dissection.
-2. **Tools → Export Baichuan Replay to File** — reassembles streams (skips 32-byte metadata, concatenates until status 300/331) and writes `replay_1.bin`, `replay_2.bin`, … (or `.mp4` if the payload starts with `ftyp`).
+1. Open your pcap in Wireshark (with the Baichuan dissector installed). Replay packets (message IDs 5, 8, 143, 381), including empty completion messages, are collected automatically during dissection.
+2. **Tools → Export Baichuan Replay to File** — reassembles streams per connection/request, keeps InfoV1/V2 and writes `replay_1.bin`, `replay_2.bin`, … (or `.mp4` if the payload contains `ftyp` at offsets 4-7). An unknown 32-byte prefix is removed only before a recognized stream.
 3. Set **Edit → Preferences → Protocols → Baichuan → Replay export directory** to choose where files are saved (empty = current directory).
 
-Exported files are raw replay payloads (often MP4). If the capture is decrypted (decryption key set), the payloads are the same as the camera sends; you can rename to `.mp4` and play, or run Neolink’s `assemble_mp4_with_mdat` logic if needed.
+Exported files are raw replay payloads (often MP4). `encryptLen`/`encryptPos` select the AES-128/CFB region; continuation bytes remain unchanged. Set the decryption key to decrypt XML and these media regions. Undecodable sections are skipped and reported as `baichuan.replay.error`.
+
+331 with section metadata or remaining `FileCount` starts another recording section; legacy final 331 and final 300 end reception. Sections are exported separately as `replay_1_section_1.bin`, …, preserving overlapping recordings. Missing start or completion uses `_partial`; packet loss and media-frame integrity are not validated. See [the download sequence](protocol.md#recording-download-id-143).
+
+Filter fields: `baichuan.replay.event`, `baichuan.replay.file_count`, `baichuan.replay.section_metadata`, `baichuan.replay.media_type`, `baichuan.replay.error`. Media types describe recognized message prefixes, not every frame in a fragmented stream. ID 144 is labelled as download stop for the observed Cam Argus 2/Cam Argus 4 flow.
+
+## Dissector tests
+
+Tests use synthetic messages, Wireshark API doubles and AES vectors; no PCAP or camera is required.
+
+```sh
+python -m pip install -r dissector/tests/requirements.txt
+python dissector/tests/test_replay.py
+```
 
 ---
 

@@ -6,15 +6,12 @@ use hex_string::HexString;
 use requestty::Question;
 use std::convert::TryInto;
 
-use aes::{
-    cipher::{AsyncStreamCipher, KeyIvInit},
-    Aes128,
-};
+use aes::{cipher::KeyIvInit, Aes128};
 use cfb_mode::Decryptor;
 
 type Aes128CfbDec = Decryptor<Aes128>;
 
-const IV: &[u8] = b"0123456789abcdef";
+const IV: &[u8; 16] = b"0123456789abcdef";
 
 fn decrypt(buf: &[u8], aeskey: &[u8; 16]) -> Vec<u8> {
     let mut decrypted = buf.to_vec();

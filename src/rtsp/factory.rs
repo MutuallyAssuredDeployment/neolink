@@ -128,7 +128,7 @@ impl StreamConfig {
             }
             BcMedia::RawReplayChunk(_) => {}
             BcMedia::ReplayStarted(_) => {} // replay-only; RTSP ignores
-            BcMedia::StreamEnd => {}
+            BcMedia::StreamEnd | BcMedia::ReplayFormat(_) | BcMedia::ReplaySection => {}
         }
     }
 }

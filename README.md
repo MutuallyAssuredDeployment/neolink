@@ -1,7 +1,7 @@
 # Neolink
 
-![Docker GHCR](https://github.com/MutuallyAssuredDeployment/neolink/actions/workflows/docker-ghcr.yml/badge.svg)
-[![dependency status](https://deps.rs/repo/github/MutuallyAssuredDeployment/neolink/status.svg)](https://deps.rs/repo/github/MutuallyAssuredDeployment/neolink)
+![Docker GHCR](https://github.com/mhhoeper/neolink/actions/workflows/docker-ghcr.yml/badge.svg)
+[![dependency status](https://deps.rs/repo/github/mhhoeper/neolink/status.svg)](https://deps.rs/repo/github/mhhoeper/neolink)
 
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
 normal RTSP clients.
@@ -20,41 +20,11 @@ does has been reverse engineered.
 ## This Fork
 
 This is a maintained fork of
+[MutuallyAssuredDeployment/neolink](https://github.com/MutuallyAssuredDeployment/neolink)
+which itself is a fork of
 [QuantumEntangledAndy/neolink](https://github.com/QuantumEntangledAndy/neolink),
 which itself was a fork of
 [thirtythreeforty/neolink](https://github.com/thirtythreeforty/neolink).
-
-This fork incorporates community PRs that were submitted to upstream but never
-merged, plus additional improvements:
-
-**Ported community contributions:**
-
-- Buffer pool bucketing to prevent FD/memory leaks — [@wafgo](https://github.com/wafgo) ([#373](https://github.com/QuantumEntangledAndy/neolink/pull/373))
-- Wireshark dissector fix for deprecated bit32 — [@Maaggs](https://github.com/Maaggs) ([#389](https://github.com/QuantumEntangledAndy/neolink/pull/389))
-- `enable_audio` and `enable_low_latency` config options — [@fromagge](https://github.com/fromagge) ([#394](https://github.com/QuantumEntangledAndy/neolink/pull/394))
-- Encoding subcommand for video compression settings — [@lorek123](https://github.com/lorek123) ([#395](https://github.com/QuantumEntangledAndy/neolink/pull/395))
-- Disk management, SD card replay/download, and alarm search — [@lorek123](https://github.com/lorek123) ([#396](https://github.com/QuantumEntangledAndy/neolink/pull/396))
-- Timestamp overflow fix (u64) preventing corruption after ~71 min — [@joshkautz](https://github.com/joshkautz) ([#398](https://github.com/QuantumEntangledAndy/neolink/pull/398))
-- Channel backpressure fix preventing keepalive timeouts — [@joshkautz](https://github.com/joshkautz) ([#399](https://github.com/QuantumEntangledAndy/neolink/pull/399))
-- Pipeline sharing to prevent per-client resource exhaustion — [@joshkautz](https://github.com/joshkautz) ([#400](https://github.com/QuantumEntangledAndy/neolink/pull/400))
-
-**Additional changes:**
-
-- Low-latency RTSP mode with frame draining, live-mode AppSrc, and reduced buffers
-- Docker images published to GHCR instead of Docker Hub
-- Updated dependencies and Debian Trixie base image
-- Use local timezone when using `update_time` to set camera time
-
-**Inherited features from upstream:**
-
-- MQTT with Home Assistant discovery
-- Motion detection
-- Paused streams (when no RTSP client or no motion detected)
-- Save still images to disk
-- Battery camera support with idle disconnect
-- PTZ control, PIR, floodlight, siren, status LED
-- Multiple discovery methods (local, remote, map, relay, cellular)
-- TLS encryption for RTSP
 
 ## Installation
 
@@ -66,8 +36,8 @@ provided.
 Images are published to GHCR on every push to `master` and on tags:
 
 ```bash
-docker pull ghcr.io/mutuallyassureddeployment/neolink:dev     # latest master
-docker pull ghcr.io/mutuallyassureddeployment/neolink:latest   # latest tagged release
+docker pull ghcr.io/mhhoeper/neolink:dev      # latest master
+docker pull ghcr.io/mhhoeper/neolink:latest   # latest tagged release
 ```
 
 Run with:
@@ -76,7 +46,7 @@ Run with:
 docker run \
   --network host \
   --volume=$PWD/neolink.toml:/etc/neolink.toml \
-  ghcr.io/mutuallyassureddeployment/neolink
+  ghcr.io/mhhoeper/neolink
 ```
 
 > `--network host` is only needed for local broadcast discovery. If you connect
@@ -164,7 +134,7 @@ address = "192.168.1.10:9000"
 stream = "mainStream"          # "mainStream", "subStream", or "both" (default)
 enable_audio = true            # disable to save CPU (default: true)
 enable_low_latency = false     # reduce stream delay (default: false)
-discovery = "local"            # "local", "remote", "map", "relay", "cellular"
+discovery = "local"            # "none", "local", "remote", "map", "relay", "cellular" (default: "relay")
 idle_disconnect = false        # disconnect when idle to save battery
 debug = false                  # dump raw XML from camera
 ```
@@ -181,7 +151,14 @@ implicitly enables prior methods):
 
 Use `discovery = "cellular"` for cellular cameras (skips local/remote).
 
-If you know the IP, set `address` directly and skip discovery entirely.
+The default is `discovery = "relay"`. Use `discovery = "local"` with a UID to
+connect on the local network without contacting Reolink servers.
+
+With a known IP, Neolink first probes TCP (normally port 9000). Setting
+`discovery = "none"` disables UID-based UDP discovery and connection setup, so
+it requires a reachable Baichuan TCP service. The TCP probe still runs. For UDP
+cameras, retain the UID and an appropriate discovery mode. Supplying `address`
+alone does not disable broadcasts when `local` discovery is used.
 
 ### MQTT
 

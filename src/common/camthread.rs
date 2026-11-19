@@ -176,10 +176,20 @@ impl NeoCamThread {
                         }
                         _ => {
                             // Non fatal
-                            log::warn!("{name}: Connection Lost: {:?}", e);
-                            log::info!("{name}: Attempt reconnect in {:?}", backoff);
-                            sleep(backoff).await;
-                            backoff *= 2;
+                            if config.discovery_error_after_retries {
+                                // Sometimes we just want to get a connection once in order to
+                                // retrieve some data. If the camera is not responding, we want
+                                // to continue with whatever we do after a number of tries.
+                                // Todo: The if clause needs to be depentant on configuration
+                                log::error!("{name}: No connection {:?}", e);
+                                self.cancel.cancel();
+                                return Err(e);
+                            } else {
+                                log::warn!("{name}: Connection Lost: {:?}", e);
+                                log::info!("{name}: Attempt reconnect in {:?}", backoff);
+                                sleep(backoff).await;
+                                backoff *= 2;
+                            }
                         }
                     }
                 }
