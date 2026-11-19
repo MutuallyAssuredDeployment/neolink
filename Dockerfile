@@ -3,7 +3,7 @@
 # Copyright (c) 2020 George Hilliard,
 #                    Andrew King,
 #                    Miroslav Šedivý
-# SPDX-License-Identifier: AGPL-3.0-only
+# SPDX-License-Identifier: AGPL-3.0-or-later
 
 FROM rust:1-slim AS build
 ARG TARGETPLATFORM
@@ -56,11 +56,17 @@ FROM debian:stable-slim
 ARG REPO
 ARG VERSION
 ARG OWNER
+ARG REVISION
+ARG SOURCE_URL
+ARG DESCRIPTION="Reolink camera to RTSP translator"
 
 LABEL org.opencontainers.image.source="$REPO" \
-      org.opencontainers.image.description="Reolink camera to RTSP translator" \
+      org.opencontainers.image.description="$DESCRIPTION" \
       org.opencontainers.image.version="$VERSION" \
-      org.opencontainers.image.vendor="$OWNER"
+      org.opencontainers.image.vendor="$OWNER" \
+      org.opencontainers.image.revision="$REVISION" \
+      org.opencontainers.image.url="$SOURCE_URL" \
+      org.opencontainers.image.licenses="AGPL-3.0-or-later"
 
 RUN rm -f /etc/apt/apt.conf.d/docker-clean; \
     echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
@@ -85,6 +91,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY --from=build /usr/local/bin/neolink /usr/local/bin/neolink
 COPY docker/entrypoint.sh /entrypoint.sh
+COPY LICENSE /usr/share/doc/neolink/LICENSE
 
 RUN gst-inspect-1.0; \
     chmod +x "/usr/local/bin/neolink" && \

@@ -27,11 +27,29 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # Build the branch commit so its source link remains meaningful after merge.
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Prepare source metadata
+        id: source
+        shell: python
+        run: |
+          import os
+          import subprocess
+
+          commit = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+          source_url = f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/tree/{commit}"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"commit={commit}", file=output)
+              print(f"source_url={source_url}", file=output)
+              print(f"description=Reolink camera to RTSP translator. Commit: {commit}. Source: {source_url}", file=output)
 
       - name: Sanitize branch name
         id: branch
         run: |
-          RAW="${{ github.head_ref }}"
+          RAW="$GITHUB_HEAD_REF"
           CLEAN=$(echo "$RAW" | sed 's/[^a-zA-Z0-9._-]/-/g')
           echo "name=$CLEAN" >> "$GITHUB_OUTPUT"
 
@@ -48,8 +66,23 @@ jobs:
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
+        env:
+          DOCKER_METADATA_PR_HEAD_SHA: "true"
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.description=${{ steps.source.outputs.description }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ steps.source.outputs.source_url }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+          annotations: |
+            org.opencontainers.image.description=${{ steps.source.outputs.description }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.commit }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ steps.source.outputs.source_url }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
           tags: |
             type=sha,prefix=,format=short
             type=raw,value=${{ steps.branch.outputs.name }}
@@ -61,9 +94,13 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
             VERSION=${{ steps.branch.outputs.name }}
-            REPO=${{ github.repository }}
+            REPO=${{ github.server_url }}/${{ github.repository }}
             OWNER=${{ github.repository_owner }}
+            REVISION=${{ steps.source.outputs.commit }}
+            SOURCE_URL=${{ steps.source.outputs.source_url }}
+            DESCRIPTION=${{ steps.source.outputs.description }}

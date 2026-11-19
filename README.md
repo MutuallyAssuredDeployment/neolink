@@ -1,6 +1,6 @@
 # Neolink
 
-![Docker GHCR](https://github.com/mhhoeper/neolink/actions/workflows/docker-ghcr.yml/badge.svg)
+[![Docker GHCR](https://github.com/mhhoeper/neolink/actions/workflows/docker-ghcr.yml/badge.svg)](https://github.com/mhhoeper/neolink/actions/workflows/docker-ghcr.yml)
 [![dependency status](https://deps.rs/repo/github/mhhoeper/neolink/status.svg)](https://deps.rs/repo/github/mhhoeper/neolink)
 
 Neolink is a small program that acts as a proxy between Reolink IP cameras and
@@ -37,8 +37,15 @@ Images are published to GHCR on every push to `master` and on tags:
 
 ```bash
 docker pull ghcr.io/mhhoeper/neolink:dev      # latest master
-docker pull ghcr.io/mhhoeper/neolink:latest   # latest tagged release
+docker pull ghcr.io/mhhoeper/neolink:latest   # latest version-tagged image
 ```
+
+Each image's GHCR description includes the full build commit and a link to that
+exact source revision. Images are labeled `AGPL-3.0-or-later` and include the
+license text at `/usr/share/doc/neolink/LICENSE`.
+
+Version tags publish versioned Docker images and update `latest`. Distribution
+uses GHCR; the workflows do not create GitHub releases or binary downloads.
 
 Run with:
 
@@ -236,7 +243,7 @@ neolink disk     --config=neolink.toml CameraName
 ## License
 
 Neolink is free software, released under the GNU Affero General Public License
-v3.
+v3 or later.
 
 ## Donations
 
