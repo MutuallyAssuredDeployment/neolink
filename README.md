@@ -164,7 +164,7 @@ address = "192.168.1.10:9000"
 stream = "mainStream"          # "mainStream", "subStream", or "both" (default)
 enable_audio = true            # disable to save CPU (default: true)
 enable_low_latency = false     # reduce stream delay (default: false)
-discovery = "local"            # "local", "remote", "map", "relay", "cellular"
+discovery = "local"            # "none", "local", "remote", "map", "relay", "cellular" (default: "relay")
 idle_disconnect = false        # disconnect when idle to save battery
 debug = false                  # dump raw XML from camera
 ```
@@ -181,7 +181,14 @@ implicitly enables prior methods):
 
 Use `discovery = "cellular"` for cellular cameras (skips local/remote).
 
-If you know the IP, set `address` directly and skip discovery entirely.
+The default is `discovery = "relay"`. Use `discovery = "local"` with a UID to
+connect on the local network without contacting Reolink servers.
+
+With a known IP, Neolink first probes TCP (normally port 9000). Setting
+`discovery = "none"` disables UID-based UDP discovery and connection setup, so
+it requires a reachable Baichuan TCP service. The TCP probe still runs. For UDP
+cameras, retain the UID and an appropriate discovery mode. Supplying `address`
+alone does not disable broadcasts when `local` discovery is used.
 
 ### MQTT
 
