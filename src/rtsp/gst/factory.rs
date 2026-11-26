@@ -138,6 +138,20 @@ impl NeoMediaFactoryImpl {
 
 impl ObjectImpl for NeoMediaFactoryImpl {}
 impl RTSPMediaFactoryImpl for NeoMediaFactoryImpl {
+    // One factory is created per camera stream and mounted under every alias
+    // of that stream (/cam, /cam/main, /cam/mainStream, ...). gst-rtsp-server
+    // keys shared medias by the request URL by default, so clients on
+    // different aliases (or the same alias with a trailing slash or a query
+    // string) each got their own media and therefore their own camera
+    // subscription for the same stream. When one of them disconnected, the
+    // VIDEO_STOP sent on drop stopped the camera stream for the others too.
+    //
+    // Using a constant key makes every client of this factory share one media
+    // and one camera stream, whatever path it used.
+    fn gen_key(&self, _url: &RTSPUrl) -> Option<glib::GString> {
+        Some("neolink-shared-media".into())
+    }
+
     fn create_element(&self, url: &RTSPUrl) -> Option<Element> {
         self.parent_create_element(url)
             .and_then(|orig| self.build_pipeline(orig).expect("Could not build pipeline"))
