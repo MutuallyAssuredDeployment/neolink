@@ -149,6 +149,12 @@ pub(super) async fn make_dummy_factory(
     .await
 }
 
+/// Longest time to learn the stream format (codec/fps) from the first frames.
+const STREAM_LEARN_TIMEOUT: Duration = Duration::from_secs(10);
+/// Longest time a gst-rtsp-server client thread waits for its pipeline.
+/// Must be larger than STREAM_LEARN_TIMEOUT plus camera start-up time.
+const PIPELINE_BUILD_TIMEOUT: Duration = Duration::from_secs(20);
+
 enum ClientMsg {
     NewClient {
         element: Element,
@@ -185,7 +191,27 @@ pub(super) async fn make_factory(
                         let mut frame_count = 0usize;
 
                         let mut stream_config = StreamConfig::new(&camera, stream).await?;
-                        while let Some(media) = media_rx.recv().await {
+                        // Bounded: the gst-rtsp-server client thread is blocked
+                        // until we reply, so a camera that never delivers frames
+                        // must not hold it (and every later client) forever.
+                        let learn_deadline = tokio::time::Instant::now() + STREAM_LEARN_TIMEOUT;
+                        loop {
+                            let media = match tokio::time::timeout_at(
+                                learn_deadline,
+                                media_rx.recv(),
+                            )
+                            .await
+                            {
+                                Ok(Some(media)) => media,
+                                Ok(None) => break,
+                                Err(_) => {
+                                    log::warn!(
+                                        "{name}::{stream}: No complete stream info after {}s ({frame_count} frames); continuing with what is known",
+                                        STREAM_LEARN_TIMEOUT.as_secs()
+                                    );
+                                    break;
+                                }
+                            };
                             stream_config.update_from_media(&media);
                             buffer.push(media);
                             if stream_config.enable_low_latency {
@@ -314,11 +340,25 @@ pub(super) async fn make_factory(
     });
 
     // Now setup the factory
+    // The callback runs on a gst-rtsp-server thread (outside the tokio
+    // runtime), so keep a handle to wait on the reply with a timeout.
+    let runtime = tokio::runtime::Handle::current();
     let factory = NeoMediaFactory::new_with_callback(move |element| {
         let (reply, new_element) = tokio::sync::oneshot::channel();
-        client_tx.blocking_send(ClientMsg::NewClient { element, reply })?;
+        client_tx
+            .try_send(ClientMsg::NewClient { element, reply })
+            .map_err(|e| anyhow!("Pipeline builder unavailable: {e}"))?;
 
-        let element = new_element.blocking_recv()?;
+        // The timer must be created inside block_on: tokio::time::timeout
+        // registers with the runtime's time driver on construction.
+        let element = runtime
+            .block_on(async { tokio::time::timeout(PIPELINE_BUILD_TIMEOUT, new_element).await })
+            .map_err(|_| {
+                anyhow!(
+                    "Pipeline not built within {}s",
+                    PIPELINE_BUILD_TIMEOUT.as_secs()
+                )
+            })??;
         Ok(Some(element))
     })
     .await?;
